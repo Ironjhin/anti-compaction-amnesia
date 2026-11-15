@@ -1,7 +1,7 @@
-# Anti-Compaction Amnesia 代码审查与现存问题清单 (For Carbon Review)
+# Anti-Compaction Amnesia 代码审查与问题修复清单 (35 / 35 ✅ 已解决)
 
-> **文档目的**：本文档旨在为 **Carbon** 提供一份完整、精确、带实测复现证据的代码审查报告与架构讨论清单。  
-> 为保证文档中引用的**所有文件名与行号（Line Numbers）与仓库源码 100% 严格对应**，当前仓库中的核心代码（`scripts/context_guardian.py`、`scripts/pre_invocation_guard.py`、`references/memory_anchor_template.md`、`SKILL.md`）**保持审查时的原始状态未作修改**。请 Carbon 基于本文档列出的数据、根因分析与开放架构问题给出改进建议或直接提交修复方案。
+> **修复状态**：✅ **全部 35 项审查问题与 6 个架构议题均已由 Carbon 修复并在 [`tests/test_fixes.py`](./tests/test_fixes.py) 验证通过（详见第 5 节）。**  
+> **说明**：第 2–3 节保留初版代码审查时的原始行号与复现证据（对应初始提交 `0a3e2c1`），所有小标题已逐条标注 `[✅ 已解决]`；完整重构与修复提交为 `006be7b`。
 
 ---
 
@@ -22,11 +22,11 @@
 
 ### 1.3 问题统计总览
 
-| 模块 | HIGH (高危) | MEDIUM (中危) | LOW / INFO (低危与说明) | 合计 |
-|---|---|---|---|---|
-| `scripts/context_guardian.py` (`@guardian-rev`) | 3 (`H1`–`H3`) | 8 (`M1`–`M8`) | 11 (`L1`–`L11`) | **22** |
-| `scripts/pre_invocation_guard.py` & `SKILL.md` (`@hook-rev`) | 2 (`HIGH-1`–`HIGH-2`) | 2 (`MED-3`, `MED-5`) | 9 (`LOW-4`, `LOW-6`–`LOW-11`, `INFO-12`, `SKILL.md`) | **13** |
-| **总计** | **5** | **10** | **20** | **35** |
+| 模块 | HIGH (高危) | MEDIUM (中危) | LOW / INFO (低危与说明) | 合计 | 修复状态 |
+|---|---|---|---|---|---|
+| `scripts/context_guardian.py` (`@guardian-rev`) | 3 (`H1`–`H3`) | 8 (`M1`–`M8`) | 11 (`L1`–`L11`) | **22** | ✅ 已解决 (22/22) |
+| `scripts/pre_invocation_guard.py` & `SKILL.md` (`@hook-rev`) | 2 (`HIGH-1`–`HIGH-2`) | 2 (`MED-3`, `MED-5`) | 9 (`LOW-4`, `LOW-6`–`LOW-11`, `INFO-12`, `SKILL.md`) | **13** | ✅ 已解决 (13/13) |
+| **总计** | **5** | **10** | **20** | **35** | **✅ 全部已解决 (35/35)** |
 
 ---
 
@@ -34,7 +34,7 @@
 
 ### 2.1 HIGH（高危问题）
 
-#### `H1`：`cmd_status` 在不含 token 字段的旧版/特定会话日志上误报 `0 / 250,000 (0.0%) -> SAFE`
+#### [✅ 已解决] `H1`：`cmd_status` 在不含 token 字段的旧版/特定会话日志上误报 `0 / 250,000 (0.0%) -> SAFE`
 - **位置**：[`scripts/context_guardian.py` L149–L152, L190–L207, L221–L225](./scripts/context_guardian.py#L190-L225)
 - **复现与实测证据**：
   - 扫描本地全部 90 个真实会话发现，仅 **34 个较新会话**包含 `input_tokens` / `cache_read_tokens` / `output_tokens` 字段（共 2,443 条记录带 token 字段）；其余 **56 个会话完全没有写入 token 字段**。
@@ -53,7 +53,7 @@
 
 ---
 
-#### `H2`：`resolve_brain_dir` 的 `"auto"` 模式按最新 `mtime` 盲选会话，在多代理（Swarm/Subagent）或多窗口并发时极易串台
+#### [✅ 已解决] `H2`：`resolve_brain_dir` 的 `"auto"` 模式按最新 `mtime` 盲选会话，在多代理（Swarm/Subagent）或多窗口并发时极易串台
 - **位置**：[`scripts/context_guardian.py` L81–L124, L642, L646, L653, L667, L673](./scripts/context_guardian.py#L81-L124) 及 [`SKILL.md` L55, L59](./SKILL.md#L55-L60)
 - **复现与实测证据**：
   - 当省略 `-c`（默认 `"auto"`）时，`resolve_brain_dir` 扫描 `brain/` 下所有子目录并选择 `transcript.jsonl` 的 `st_mtime` 最新者（L116–L122）。
@@ -67,7 +67,7 @@
 
 ---
 
-#### `H3`：`CHECKPOINT_USER_TRUNCATE_BYTES = 500` 与真实截断阈值不符，且无论是否发生压缩均误标 `[TRUNCATED BY CHECKPOINT]`
+#### [✅ 已解决] `H3`：`CHECKPOINT_USER_TRUNCATE_BYTES = 500` 与真实截断阈值不符，且无论是否发生压缩均误标 `[TRUNCATED BY CHECKPOINT]`
 - **位置**：[`scripts/context_guardian.py` L26, L259, L303, L331, L534](./scripts/context_guardian.py#L26)（同时影响 `pre_invocation_guard.py` L183, L213, L238, L303 与 `SKILL.md` L23, L63 及模板 L48）
 - **复现与实测证据**：
   - **实测发现 1（真实截断阈值并非 500 字节）**：编写脚本扫描本地全部 180 个日志文件中所有 `CHECKPOINT` 的 `# User Requests` 段落，提取所有带 `<truncated N bytes>` 标记的条目（共 12 处真实截断样本），测量 `<truncated ...>` 前保留的原文长度：
@@ -85,7 +85,7 @@
 
 ### 2.2 MEDIUM（中危问题）
 
-#### `M1`：未处理重试/回退（Rewind）产生的重复及乱序 `step_index`，导致被撤销的 `CHECKPOINT` 仍被计入且关键步骤被静默覆盖
+#### [✅ 已解决] `M1`：未处理重试/回退（Rewind）产生的重复及乱序 `step_index`，导致被撤销的 `CHECKPOINT` 仍被计入且关键步骤被静默覆盖
 - **位置**：[`scripts/context_guardian.py` L190–L204, L243–L262, L274–L279, L480–L486](./scripts/context_guardian.py#L190-L204)
 - **复现与实测证据**：
   - 在 `5f9d5f3e` 中存在 **12 个重复的 `step_index` 和 23 处 `step_index` 回退（order breaks）**；在 `b99351bf` 和 `270c6a38` 中同样存在回退重用。
@@ -113,7 +113,7 @@
 
 ---
 
-#### `M2`：`cmd_status` 在刚完成 `CHECKPOINT` 但尚未产生新 `PLANNER_RESPONSE` 时，仍显示压缩前的 `CRITICAL` 水位
+#### [✅ 已解决] `M2`：`cmd_status` 在刚完成 `CHECKPOINT` 但尚未产生新 `PLANNER_RESPONSE` 时，仍显示压缩前的 `CRITICAL` 水位
 - **位置**：[`scripts/context_guardian.py` L194–L204, L221–L224](./scripts/context_guardian.py#L194-L204)
 - **复现与根因分析**：
   - `cmd_status` 仅在 `rec.get("type") == "PLANNER_RESPONSE"` 时更新 `latest_tokens`（L199–L201）。
@@ -123,7 +123,7 @@
 
 ---
 
-#### `M3`：`cmd_search` 对 `tool_calls` 进行二次 JSON 序列化，导致 Windows 反斜杠路径（如 `C:\Users\...`）因四重转义而无法搜出
+#### [✅ 已解决] `M3`：`cmd_search` 对 `tool_calls` 进行二次 JSON 序列化，导致 Windows 反斜杠路径（如 `C:\Users\...`）因四重转义而无法搜出
 - **位置**：[`scripts/context_guardian.py` L165–L172, L397–L398](./scripts/context_guardian.py#L397-L398)
 - **复现与实测证据**：
   - 在 `transcript_full.jsonl` 中，`tool_calls` 数组内每个工具调用的 `args` 字段值**本身已经是 JSON 序列化后的字符串**，例如：
@@ -141,7 +141,7 @@
 
 ---
 
-#### `M4`：`cmd_search` 将含反斜杠的普通文本（如 Windows 路径）静默编译为合法正则转义序列，导致漏搜且不触发字面量回退
+#### [✅ 已解决] `M4`：`cmd_search` 将含反斜杠的普通文本（如 Windows 路径）静默编译为合法正则转义序列，导致漏搜且不触发字面量回退
 - **位置**：[`scripts/context_guardian.py` L420–L423, L651–L662](./scripts/context_guardian.py#L420-L423)
 - **复现与根因分析**：
   - L420–L423 逻辑为：先尝试 `re.compile(args.pattern, re.IGNORECASE)`，仅在抛出 `re.error` 时才回退到 `re.escape(args.pattern)`。
@@ -152,7 +152,7 @@
 
 ---
 
-#### `M5`：`cmd_init_anchor` 与 `cmd_recover` 的用户输入索引表无上限，在长会话中生成 31 KB 锚点文件，违背 `SKILL.md` `< 4 KB` 约束
+#### [✅ 已解决] `M5`：`cmd_init_anchor` 与 `cmd_recover` 的用户输入索引表无上限，在长会话中生成 31 KB 锚点文件，违背 `SKILL.md` `< 4 KB` 约束
 - **位置**：[`scripts/context_guardian.py` L298–L309, L531–L555](./scripts/context_guardian.py#L531-L555) 及 [`SKILL.md` L123](./SKILL.md#L123)
 - **复现与实测证据**：
   - `SKILL.md` L123 明确规定：“用‘简明事实 + `step_index` 书签’保持锚点精炼（建议 < 4 KB）”。
@@ -165,7 +165,7 @@
 
 ---
 
-#### `M6`：`load_hooks_json` 与 `cmd_hook` 不支持 UTF-8 BOM、非原子写入 `hooks.json`，且条目类型异常时崩溃
+#### [✅ 已解决] `M6`：`load_hooks_json` 与 `cmd_hook` 不支持 UTF-8 BOM、非原子写入 `hooks.json`，且条目类型异常时崩溃
 - **位置**：[`scripts/context_guardian.py` L560–L570, L589–L630](./scripts/context_guardian.py#L560-L630)
 - **复现与实测证据**：
   1. **UTF-8 BOM 崩溃（已复现）**：在 Windows 上，用户或脚本常使用 PowerShell 5.1 的 `Set-Content -Encoding UTF8` 编辑配置文件，这会在文件头写入 `EF BB BF`（UTF-8 BOM）。由于 `load_hooks_json`（L564）使用 `encoding="utf-8"` 而非 `"utf-8-sig"`，实测传入带 BOM 的 `hooks.json` 时直接报错退出：
@@ -179,7 +179,7 @@
 
 ---
 
-#### `M7`：`build_hook_spec` 使用裸 `python` 且仅在路径含空格时加引号，在 Windows `cmd /c` 下存在环境与特殊字符隐患
+#### [✅ 已解决] `M7`：`build_hook_spec` 使用裸 `python` 且仅在路径含空格时加引号，在 Windows `cmd /c` 下存在环境与特殊字符隐患
 - **位置**：[`scripts/context_guardian.py` L573–L586](./scripts/context_guardian.py#L573-L586)（关联 `pre_invocation_guard.py` 的 `MED-5`）
 - **复现与根因分析**：
   - 根据 Antigravity 官方文档 `docs/hooks.md` L129–L130，Windows 上的 Hook 命令通过 `cmd /c` 执行。
@@ -197,7 +197,7 @@
 
 ---
 
-#### `M8`：`DEFAULT_BRAIN_ROOT` 硬编码为 `~/.gemini/antigravity/brain`，不支持 `antigravity-cli` / `antigravity-ide` 且未暴露 CLI 参数
+#### [✅ 已解决] `M8`：`DEFAULT_BRAIN_ROOT` 硬编码为 `~/.gemini/antigravity/brain`，不支持 `antigravity-cli` / `antigravity-ide` 且未暴露 CLI 参数
 - **位置**：[`scripts/context_guardian.py` L29, L81–L93](./scripts/context_guardian.py#L29)
 - **复现与根因分析**：
   - 根据 Antigravity 内置文档 `agy-customizations/docs/hooks.md` L173–L180，不同宿主界面的目录名不同：
@@ -212,47 +212,47 @@
 
 ### 2.3 LOW（低危与易用性问题）
 
-#### `L1`：`cmd_status` 中 `records_since = len(records) - last_line` 混用了有效记录数与文件物理行号
+#### [✅ 已解决] `L1`：`cmd_status` 中 `records_since = len(records) - last_line` 混用了有效记录数与文件物理行号
 - **位置**：[`scripts/context_guardian.py` L230](./scripts/context_guardian.py#L230)
 - **说明**：`len(records)` 是解析成功的 JSON 对象数量，而 `last_line` 是文件 1-based 物理行号。一旦文件中存在空行或因并发写入截断被跳过的损坏行（L138, L143），两者相减得出的 `records_since` 就会偏小甚至为负数。应改为使用该 `CHECKPOINT` 在 `records` 列表中的下标 `len(records) - 1 - last_ckpt_idx`。
 
-#### `L2`：`iter_jsonl_records` 静默忽略损坏的 JSON 行，未在 `status` 中报告跳过行数
+#### [✅ 已解决] `L2`：`iter_jsonl_records` 静默忽略损坏的 JSON 行，未在 `status` 中报告跳过行数
 - **位置**：[`scripts/context_guardian.py` L132–L146](./scripts/context_guardian.py#L132-L146)
 - **说明**：流式追加写入时末尾可能出现半行 JSON，静默跳过是合理的容错设计；但如果文件中间存在多行损坏记录，完全不统计也不在 `status` 中提示会掩盖日志损坏问题。
 
-#### `L3`：`recover` / `search` / `step` 在缺失 `transcript_full.jsonl` 时静默回退到有损 `transcript.jsonl`
+#### [✅ 已解决] `L3`：`recover` / `search` / `step` 在缺失 `transcript_full.jsonl` 时静默回退到有损 `transcript.jsonl`
 - **位置**：[`scripts/context_guardian.py` L269, L416, L463](./scripts/context_guardian.py#L269)
 - **说明**：在 `5f9d5f3e` 的 `transcript.jsonl` 中，共有 **751 条记录包含 `truncated_fields`**（其中 `content` 被截断 593 次，`tool_calls` 155 次，`thinking` 5 次）。当 `transcript_full.jsonl` 缺失而回退到 `transcript.jsonl` 时，脚本未向 `stderr` 或输出头部打印任何有损回退警告。
 
-#### `L4`：`search --type` 缺少 `ERROR_MESSAGE` 枚举值，且 `search` 与 `step` 均忽略了记录中的 `error` 字段
+#### [✅ 已解决] `L4`：`search --type` 缺少 `ERROR_MESSAGE` 枚举值，且 `search` 与 `step` 均忽略了记录中的 `error` 字段
 - **位置**：[`scripts/context_guardian.py` L387–L399, L503–L512, L655–L659](./scripts/context_guardian.py#L655-L659)
 - **复现证据**：全库扫描发现真实日志中存在 **6 种 `type`**：`PLANNER_RESPONSE`、`GENERIC`、`SYSTEM_MESSAGE`、`USER_INPUT`、`CHECKPOINT` 以及 **`ERROR_MESSAGE`（在 `5f9d5f3e` 中有 78 条，全库共 156 条）**；同时有 **544 条记录包含顶层 `"error"` 字段**。但 `--type` 的 `choices`（L657）未列出 `ERROR_MESSAGE`，ทำให้无法按 `--type ERROR_MESSAGE` 过滤；且 `extract_search_fields` 与 `cmd_step` 均只处理 `content`/`thinking`/`tool_calls`，完全丢弃了 `rec.get("error")`。
 
-#### `L5`：`cmd_search` 搜索以 `-` 开头的关键词（如命令行参数 `-rf`、`-c`）时被 `argparse` 拦截报错
+#### [✅ 已解决] `L5`：`cmd_search` 搜索以 `-` 开头的关键词（如命令行参数 `-rf`、`-c`）时被 `argparse` 拦截报错
 - **位置**：[`scripts/context_guardian.py` L652](./scripts/context_guardian.py#L652)
 - **复现证据**：实测执行 `python context_guardian.py search "-rf" -c 5f9d5f3e` 直接被 `argparse` 当作未知选项拒绝（退出码 2）。应在帮助信息与 `SKILL.md` 中说明使用 `--` 分隔符（`search -- "-rf"`）。
 
-#### `L6`：`cmd_init_anchor --force` 直接覆盖手写 `MEMORY_ANCHOR.md` 且无备份
+#### [✅ 已解决] `L6`：`cmd_init_anchor --force` 直接覆盖手写 `MEMORY_ANCHOR.md` 且无备份
 - **位置**：[`scripts/context_guardian.py` L520–L522, L555](./scripts/context_guardian.py#L520-L522)
 - **说明**：若 Agent 在已精心维护的 `MEMORY_ANCHOR.md` 上误传 `--force`，原有的铁律、精确参数与死胡同记录会被空模板瞬间冲掉。应在 `--force` 覆盖前自动备份为 `MEMORY_ANCHOR.md.bak` 并采用原子写入。
 
-#### `L7`：`resolve_brain_dir` 未校验 `conversation_id` 格式，允许路径穿越（如 `-c ..`）
+#### [✅ 已解决] `L7`：`resolve_brain_dir` 未校验 `conversation_id` 格式，允许路径穿越（如 `-c ..`）
 - **位置**：[`scripts/context_guardian.py` L94–L97](./scripts/context_guardian.py#L94-L97)
 - **复现证据**：实测调用 `resolve_brain_dir("..", brain_root)` 时，`exact = root / ".."` 满足 `exact.is_dir()`，直接返回了父目录。应对 `conversation_id` 做正则校验（如 `^[0-9a-fA-F-]{4,36}$`）并确保 `exact.resolve().parent == root.resolve()`。
 
-#### `L8`：`cmd_recover` 第 4 节硬编码截断长度（600/800 字符），且在无 `CHECKPOINT` 分支漏打 `thinking` 与 `tool_calls`
+#### [✅ 已解决] `L8`：`cmd_recover` 第 4 节硬编码截断长度（600/800 字符），且在无 `CHECKPOINT` 分支漏打 `thinking` 与 `tool_calls`
 - **位置**：[`scripts/context_guardian.py` L349–L373](./scripts/context_guardian.py#L349-L373)
 - **说明**：第 4 节在有 `CHECKPOINT` 时打印 `thinking`（硬编码 600 字）、`tool_calls`（600 字）、`content`（800 字），忽略了用户传入的 `--max-chars`；而在 `else`（尚无 `CHECKPOINT`）分支（L366–L373）只打印了 `content`，完全漏掉了 `thinking` 和 `tool_calls`。
 
-#### `L9`：`cmd_step` 默认 `--max-chars 0`（无限制）配合大区间参数时可一次性向终端倾倒数 MB 数据
+#### [✅ 已解决] `L9`：`cmd_step` 默认 `--max-chars 0`（无限制）配合大区间参数时可一次性向终端倾倒数 MB 数据
 - **位置**：[`scripts/context_guardian.py` L467–L470, L668](./scripts/context_guardian.py#L467-L470)
 - **说明**：`SKILL.md` 硬约束严禁裸读大段原始日志撑爆上下文，但 `step 1 1000` 在默认 `--max-chars 0` 下会无截断输出上千步的全部 `thinking`、`tool_calls` 与 `content`。当查询步数 `> 3` 且未显式指定 `--max-chars` 时，应设置安全默认上限（如每字段 4,000 字符）。
 
-#### `L10`：`cmd_hook` 的 `--status` / `--enable` / `--disable` 未使用 `mutually_exclusive_group`，且无参调用时报错
+#### [✅ 已解决] `L10`：`cmd_hook` 的 `--status` / `--enable` / `--disable` 未使用 `mutually_exclusive_group`，且无参调用时报错
 - **位置**：[`scripts/context_guardian.py` L592–L594, L677–L682](./scripts/context_guardian.py#L677-L682)
 - **说明**：使用 `p_hook.add_mutually_exclusive_group()` 并在未传标志时默认执行 `--status` 更符合 CLI 直觉。
 
-#### `L11`：`prompt.encode("utf-8")` 与 `anchor_path.write_text(..., encoding="utf-8")` 未指定 `errors="replace"`
+#### [✅ 已解决] `L11`：`prompt.encode("utf-8")` 与 `anchor_path.write_text(..., encoding="utf-8")` 未指定 `errors="replace"`
 - **位置**：[`scripts/context_guardian.py` L250, L555](./scripts/context_guardian.py#L250)
 - **说明**：虽然全库 180 个真实日志中未检出孤立代理项（Lone Surrogates `[\uD800-\uDFFF]`），但 JSON 解析器允许解析 `\ud83d` 这类未配对代理项。一旦日志中出现孤立代理项，`.encode("utf-8")` 会抛出 `UnicodeEncodeError`。建议统一加上 `errors="replace"`。
 
@@ -283,7 +283,7 @@
 
 ### 3.2 HIGH（高危问题）
 
-#### `HIGH-1`：首次启用钩子或状态文件丢失时，会将 256 KB 尾部内的陈旧历史 `CHECKPOINT` 误判为“刚刚触发压缩”并注入过时恢复包（已复现）
+#### [✅ 已解决] `HIGH-1`：首次启用钩子或状态文件丢失时，会将 256 KB 尾部内的陈旧历史 `CHECKPOINT` 误判为“刚刚触发压缩”并注入过时恢复包（已复现）
 - **位置**：[`scripts/pre_invocation_guard.py` L89–L104, L347–L383](./scripts/pre_invocation_guard.py#L347-L383)
 - **复现与实测证据**：
   - 当会话目录尚无 `scratch/.compaction_guard_state.json`（例如用户在长会话中途首次启用本钩子、清理了 `scratch/`、或状态文件损坏被重置为 `last_handled_checkpoint_step: -1`）时，只要 `transcript.jsonl` 末尾 256 KB 内存在任何历史 `CHECKPOINT`，L366 的 `if ckpt_step > prev_step or ckpt_key != prev_key:` 就会立即触发。
@@ -297,7 +297,7 @@
 
 ---
 
-#### `HIGH-2`：在构造输出与刷写 `stdout` 之前就提前持久化了 `save_state`，一旦后续异常或超时将永久丢失恢复注入
+#### [✅ 已解决] `HIGH-2`：在构造输出与刷写 `stdout` 之前就提前持久化了 `save_state`，一旦后续异常或超时将永久丢失恢复注入
 - **位置**：[`scripts/pre_invocation_guard.py` L372 (早于 L377), L396 (早于 L404)](./scripts/pre_invocation_guard.py#L366-L409)
 - **复现与根因分析**：
   - 在 Case A（检测到新 `CHECKPOINT`）中，脚本在第 372 行就调用了 `save_state(state_path, state)` 将该 `CHECKPOINT` 标记为“已处理”，随后才在第 377 行调用 `build_post_compaction_output(...)` 去读取 1–4 MB 的 `transcript_full.jsonl` 并构造输出，最后在 `main()` 第 426 行写入 `stdout`。
@@ -310,7 +310,7 @@
 
 ### 3.3 MEDIUM（中危问题）
 
-#### `MED-3`：`read_tail_records` 使用 `str.splitlines()` 切分 JSONL，遇到行内未转义的 `U+0085` / `U+2028` / `U+2029` 会把单条 JSON 劈成两半导致记录静默丢失（已复现）
+#### [✅ 已解决] `MED-3`：`read_tail_records` 使用 `str.splitlines()` 切分 JSONL，遇到行内未转义的 `U+0085` / `U+2028` / `U+2029` 会把单条 JSON 劈成两半导致记录静默丢失（已复现）
 - **位置**：[`scripts/pre_invocation_guard.py` L56–L62](./scripts/pre_invocation_guard.py#L56-L62)
 - **复现与实测证据**：
   - JSONL 规范以字节 `0x0A`（`\n`）或 `\r\n` 作为记录分隔符。但 Python 的 `str.splitlines()` 不仅按 `\r` / `\n` 切分，还会按 Unicode 行分隔符 **`U+0085` (NEL, UTF-8 `C2 85`)、`U+2028` (LS)、`U+2029` (PS)、`\x0b`、`\x0c`、`\x1c`–`\x1e`** 切分！
@@ -325,7 +325,7 @@
 
 ---
 
-#### `MED-5`：`hooks.json` 与 `context_guardian.py` 使用裸 `python`，在 Windows `cmd /c` 环境下存在解释器解析与编码风险
+#### [✅ 已解决] `MED-5`：`hooks.json` 与 `context_guardian.py` 使用裸 `python`，在 Windows `cmd /c` 环境下存在解释器解析与编码风险
 - **位置**：`$HOME/.gemini/config/hooks.json` L6 及 [`scripts/context_guardian.py` L582](./scripts/context_guardian.py#L582)
 - **复现与实测证据**：
   - 在当前机器的 PowerShell 中测试 `Get-Command python -All`，发现存在两个不同解释器：`WindowsApps\python.exe`（转发至 `pythoncore-3.14-64`）与 `C:\msys64\mingw64\bin\python.exe`。
@@ -337,7 +337,7 @@
 
 ### 3.4 LOW / INFO（低危问题、边界情况与文档偏差）
 
-#### `LOW-4`：`read_tail_records` 在 `start > 0` 时无条件丢弃第一行，当 `start` 恰好落在行首边界时会凭空丢掉一条完整记录（已复现）
+#### [✅ 已解决] `LOW-4`：`read_tail_records` 在 `start > 0` 时无条件丢弃第一行，当 `start` 恰好落在行首边界时会凭空丢掉一条完整记录（已复现）
 - **位置**：[`scripts/pre_invocation_guard.py` L52–L60](./scripts/pre_invocation_guard.py#L52-L60)
 - **复现与根因分析**：
   - L58–L60 写有 `if start > 0 and lines: lines = lines[1:]`，假设 `start` 一定落在一行中间。但如果 `start = size - tail_bytes` 恰好位于上一行换行符 `\n` 之后的第一字节（即新记录的行首），`lines[0]` 实际上是一条完整的 JSON 记录，却被无条件丢弃了（实测构造 4 行样本在边界处读取，预期返回 `[3, 4]`，实际只返回 `[4]`）。
@@ -353,13 +353,13 @@
 
 ---
 
-#### `LOW-6`：`main()` 输出 Hook 结果时使用 `ensure_ascii=False`，依赖 Windows 管道 UTF-8 重配置成功
+#### [✅ 已解决] `LOW-6`：`main()` 输出 Hook 结果时使用 `ensure_ascii=False`，依赖 Windows 管道 UTF-8 重配置成功
 - **位置**：[`scripts/pre_invocation_guard.py` L426](./scripts/pre_invocation_guard.py#L426)
 - **说明**：L426 使用 `json.dumps(result, ensure_ascii=False)` 直接向 `stdout` 输出中文字符与 Emoji（如 `🛡️`、`⚠️`）。虽然 L415 调用了 `configure_utf8_stdio()`，但在 `cmd /c` 管道及不同宿主编码设置下，直接输出 `ensure_ascii=True`（纯 ASCII 的 `\uXXXX` JSON 转义序列）在被宿主 `json.loads` 解析时与原文 100% 等价，且**彻底消除了任何跨平台/跨代码页乱码的可能性**。
 
 ---
 
-#### `LOW-7`：90 秒锚点免打扰窗口（Grace Window）在检查前就已经更新了 `last_warned_band`，导致 `220k CRITICAL` 预警被静默吞掉且不再触发
+#### [✅ 已解决] `LOW-7`：90 秒锚点免打扰窗口（Grace Window）在检查前就已经更新了 `last_warned_band`，导致 `220k CRITICAL` 预警被静默吞掉且不再触发
 - **位置**：[`scripts/pre_invocation_guard.py` L394–L409](./scripts/pre_invocation_guard.py#L394-L409)
 - **复现与根因分析**：
   - 当 token 跨越 185k（Band 1）或 220k（Band 2）时，L395–L396 **先将 `state["last_warned_band"] = current_band` 写入磁盘**，然后才在 L398–L402 检查 `MEMORY_ANCHOR.md` 的修改时间是否在 90 秒以内（若是则返回 `{}` 跳过提醒）。
@@ -369,7 +369,7 @@
 
 ---
 
-#### `LOW-8`：当尾部 256 KB 内暂无带 token 的 `PLANNER_RESPONSE`（`latest_tokens == 0`）时，会将 `last_warned_band` 重置为 0，缺乏迟滞（Hysteresis）保护
+#### [✅ 已解决] `LOW-8`：当尾部 256 KB 内暂无带 token 的 `PLANNER_RESPONSE`（`latest_tokens == 0`）时，会将 `last_warned_band` 重置为 0，缺乏迟滞（Hysteresis）保护
 - **位置**：[`scripts/pre_invocation_guard.py` L346–L356, L388–L391](./scripts/pre_invocation_guard.py#L388-L391)
 - **根因分析**：
   - 若某次超大工具调用输出（如单条 `GENERIC` 步骤占了 >256 KB）把上一条 `PLANNER_RESPONSE` 挤出了 256 KB 尾部窗口，此时 `latest_tokens` 算出来为 `0`，`current_band` 为 `0`。
@@ -379,7 +379,7 @@
 
 ---
 
-#### `LOW-9`：当目标 `CHECKPOINT` 超出 `transcript_full.jsonl` 的 4 MB 读取窗口时，`ckpt_pos == -1` 会把压缩后的最新模型回复误标为“压缩前快照”
+#### [✅ 已解决] `LOW-9`：当目标 `CHECKPOINT` 超出 `transcript_full.jsonl` 的 4 MB 读取窗口时，`ckpt_pos == -1` 会把压缩后的最新模型回复误标为“压缩前快照”
 - **位置**：[`scripts/pre_invocation_guard.py` L141–L145, L188–L195, L248–L261, L374–L376](./scripts/pre_invocation_guard.py#L188-L195)
 - **根因分析**：
   1. 在 `extract_compaction_recovery_bundle` 中，若未在窗口内找到目标 `CHECKPOINT`（`ckpt_pos == -1`），L189 `search_end = ckpt_pos if ckpt_pos >= 0 else len(records)` 会从列表末尾向前找最后一条 `PLANNER_RESPONSE`，并在第 3 节（L250）将其标题打印为 `### 3. 压缩前最后一次模型执行快照`——但当 `ckpt_pos == -1` 时，文件末尾的 `PLANNER_RESPONSE` 实际上是**压缩后**的回复！
@@ -389,19 +389,19 @@
 
 ---
 
-#### `LOW-10`：`save_state` 非原子写入 `.compaction_guard_state.json`
+#### [✅ 已解决] `LOW-10`：`save_state` 非原子写入 `.compaction_guard_state.json`
 - **位置**：[`scripts/pre_invocation_guard.py` L107–L110](./scripts/pre_invocation_guard.py#L107-L110)
 - **说明**：`state_path.write_text(...)` 若在写入中途被进程终止，会留下半截损坏的 JSON 文件。下一轮 `load_state`（L98–L104）捕获异常后会回退到全默认状态（`last_handled_checkpoint_step: -1`），进而直接触发 `HIGH-1`（把历史旧 `CHECKPOINT` 当成新压缩再次注入）。应使用同目录 `.tmp` 临时文件 + `os.replace` 原子写入。
 
 ---
 
-#### `LOW-11`：Token 水位检测天然滞后 1 个模型轮次（One-Step Token Lag）
+#### [✅ 已解决] `LOW-11`：Token 水位检测天然滞后 1 个模型轮次（One-Step Token Lag）
 - **位置**：[`scripts/pre_invocation_guard.py` L348–L352](./scripts/pre_invocation_guard.py#L348-L352)
 - **说明**：`PreInvocation` 在模型调用**之前**运行，此时当前轮次尚未产生 `PLANNER_RESPONSE`，因此脚本读到的 `latest_tokens` 是**上一轮** `PLANNER_RESPONSE` 的 `input_tokens + cache_read_tokens`，尚未计入上一轮刚返回的 `GENERIC` 工具输出体积和本轮新增的 `USER_INPUT` 体积。虽然 220k 到 250k 之间留有 30k tokens 的缓冲裕量，但如果用户在 215k 时执行了一个返回 40k tokens 的工具调用，系统会在触发 220k 预警之前直接冲破 250k 触发压缩。建议在 `SKILL.md` 中明确说明这一机制。
 
 ---
 
-#### `INFO-12`：`PreInvocation` 钩子与宿主内部自动 `CHECKPOINT` 生成的先后时序待实测确认
+#### [✅ 已解决] `INFO-12`：`PreInvocation` 钩子与宿主内部自动 `CHECKPOINT` 生成的先后时序待实测确认
 - **位置**：[`scripts/pre_invocation_guard.py` L360–L383](./scripts/pre_invocation_guard.py#L360-L383) 及 [`SKILL.md` L110](./SKILL.md#L110)
 - **实测数据分析**：
   - 检查真实会话 `0864f417` 的时间戳：
@@ -413,47 +413,47 @@
 
 ---
 
-#### `SKILL.md` 文档表述偏差
+#### [✅ 已解决] `SKILL.md` 文档表述偏差
 1. **[`SKILL.md` L108](./SKILL.md#L108)**：写有“只扫描末尾 ≤256 KB”，表述不完整。实际上 `pre_invocation_guard.py` 在平时扫描 `transcript.jsonl` 末尾 256 KB，但在检测到 `CHECKPOINT` 触发恢复时，会读取最多 **2 MB 全量或 1 MB–4 MB 尾部**的 `transcript_full.jsonl`（`pre_invocation_guard.py` L41–L43, L120–L129）。
 2. **[`SKILL.md` L110](./SKILL.md#L110)**：写有“在模型恢复后的首次调用自动读取……”，受限于上述 `INFO-12` 的宿主生命周期顺序，若 `PreInvocation` 早于 `CHECKPOINT` 执行，则实际注入发生在压缩后的第二次模型调用。
 3. **[`SKILL.md` L124](./SKILL.md#L124)**：写有“不要在 `hooks.json` 中手动修改状态文件来绕过边沿检测”，表述容易引起误解——边沿检测状态文件并非保存在 `hooks.json` 中，而是保存在会话 Artifact 目录下的 `<artifactDir>/scratch/.compaction_guard_state.json`。
 
 ---
 
-## 4. 待 Carbon 重点审查与建议的开放架构问题 (Open Architectural Questions for Carbon)
+## 4. 架构设计议题与决策记录 (Resolved in Section 5)
 
 请 **Carbon** 在审查上述具体代码缺陷的同时，重点针对以下 6 个架构与设计权衡给出决策建议：
 
-### 问题 1：`PreInvocation` 与 `CHECKPOINT` 的生命周期时序与零延迟恢复 (`INFO-12`, `LOW-11`)
+### [✅ 已解决] 问题 1：`PreInvocation` 与 `CHECKPOINT` 的生命周期时序与零延迟恢复 (`INFO-12`, `LOW-11`)
 - **背景**：如果 Antigravity 宿主在单次模型调用周期内的执行顺序是 `PreInvocation Hook -> (内部检查发现超 250k) -> 生成 CHECKPOINT -> 调用 LLM`，那么在压缩刚完成后的第一次 LLM 推理时，`PreInvocation` 已经跑过了，`pre_invocation_guard.py` 的恢复包要等到下一次工具调用后的 `PreInvocation`（即压缩后第 2 轮推理）才能注入。
 - **请 Carbon 建议**：
   1. 是否应当在接近 250k（例如 `>= 235k tokens` 或预计加上本轮 `lastUserInput` 将逼近 250k）时，在 `PreInvocation` 阶段就**提前预注入（Pre-emptive Injection）** 最核心的 `MEMORY_ANCHOR.md` 摘要？还是说在 `CHECKPOINT` 之前的注入同样会被 `CHECKPOINT` 摘要器压掉？
   2. 是否有更优的 Hook 事件组合（例如结合 `PostToolUse` 或 `PostInvocation` 提前感知大体积工具输出导致的 token 激增）来弥补 `LOW-11` 的一步滞后？
 
-### 问题 2：缺失 Token 遥测字段的会话（Legacy / Stripped Transcripts）如何精确估算水位 (`H1`, `LOW-8`)
+### [✅ 已解决] 问题 2：缺失 Token 遥测字段的会话（Legacy / Stripped Transcripts）如何精确估算水位 (`H1`, `LOW-8`)
 - **背景**：实测本地 90 个会话中有 56 个不含 `input_tokens` / `cache_read_tokens`（包括 15.8 MB、25 次压缩的 `5f9d5f3e`）。在这些会话上，`status` 和 `pre_invocation_guard.py` 的水位预警目前完全失效（永远显示 0 tokens / `SAFE`）。
 - **请 Carbon 建议**：
   - 当检测不到 `input_tokens` 字段时，`context_guardian.py` 和 `pre_invocation_guard.py` 应当采用何种回退估算模型？
   - 候选方案 A：统计自最新一次有效 `CHECKPOINT` 以来所有记录的 `content + thinking + tool_calls` UTF-8 字节数（或字符数），加上最新 `CHECKPOINT` 自身的字节数，按经验系数（如中文/代码混合场景 `1 token ≈ 3.2 ~ 4.0 bytes`）估算当前活跃上下文 token 数，并标注 `(estimated)`。
   - 候选方案 B：在 `pre_invocation_guard.py` 的 256 KB 尾部扫描中，若无 token 字段，是否需要向上回溯到最近一个 `CHECKPOINT` 来计算累积字节数？
 
-### 问题 3：多代理并发（Swarm / Subagents）下的会话 ID 自动解析安全机制 (`H2`)
+### [✅ 已解决] 问题 3：多代理并发（Swarm / Subagents）下的会话 ID 自动解析安全机制 (`H2`)
 - **背景**：当不传 `-c`（默认 `"auto"`）时，按 `transcript.jsonl` 的最新 `mtime` 选择会话在单会话场景下很方便，但在 Swarm 多代理并发或开启多个 IDE 窗口时，几乎必然产生竞态串台。
 - **请 Carbon 建议**：
   - 是否应当在 CLI 中将写操作（如 `init-anchor`）改为**强制要求显式传入 `-c <conversation-id>`**（或当检测到过去 N 秒内有多个会话活跃时拒绝 `"auto"`）？
   - 是否有办法通过环境变量、进程树工作目录（`cwd`）或其它线索更可靠地推断当前 Agent 所属的 `conversation_id`？
 
-### 问题 4：`MEMORY_ANCHOR.md` 的体积控制与自动索引策略 (`M5`)
+### [✅ 已解决] 问题 4：`MEMORY_ANCHOR.md` 的体积控制与自动索引策略 (`M5`)
 - **背景**：`init-anchor` 目前把会话中所有历史 `USER_INPUT`（在长会话中可达 300+ 条、31 KB）全部写入 `MEMORY_ANCHOR.md` 底部，违背了 `< 4 KB` 的精炼原则，且在压缩后被 Hook 自动注入时会浪费大量上下文。
 - **请 Carbon 建议**：
   - `init-anchor` 自动生成的历史输入索引应当采用什么筛选策略？（例如：仅保留 `> 1000B` 的易截断长输入 + 最近 10 条输入，总行数限制在 20 行以内；还是完全不在 `MEMORY_ANCHOR.md` 中存放自动生成的全量索引，完全交由 `context_guardian.py recover` 实时从 `transcript_full.jsonl` 提取？）
 
-### 问题 5：回退重试（Rewound Steps）与重复 `step_index` 的统一数据模型 (`M1`, `HIGH-1`)
+### [✅ 已解决] 问题 5：回退重试（Rewound Steps）与重复 `step_index` 的统一数据模型 (`M1`, `HIGH-1`)
 - **背景**：实测证实 Antigravity 在用户重试、流中断恢复或回退时，会在 JSONL 末尾追加相同甚至更小的 `step_index`，甚至会出现“先写入 `step=442 CHECKPOINT`，随后回退重跑变成 `step=442 PLANNER_RESPONSE`”的情况。
 - **请 Carbon 建议**：
   - 是否应当在 `context_guardian.py` 中抽取出一个统一的规范化函数（如 `canonicalize_records(records)`），在解析 JSONL 后通过单次反向扫描（Backward Pass：从文件末尾向前维护当前最小 `step_index`，任何排在前面但 `step_index >= 后方某条记录 step_index` 的记录均标记为 `superseded=True`），从而让 `status`、`recover`、`step`、`init-anchor` 以及 `pre_invocation_guard.py` 共享完全一致的“有效主干分支（Active Branch）”视图？
 
-### 问题 6：`CHECKPOINT` 中 `# User Requests` 截断判定的精确实现 (`H3`)
+### [✅ 已解决] 问题 6：`CHECKPOINT` 中 `# User Requests` 截断判定的精确实现 (`H3`)
 - **背景**：实测 12 处真实 `<truncated N bytes>` 样本表明，系统在 `CHECKPOINT` 中保留的用户请求前缀长度为 **1,021 字节**或 **1,391–1,392 字节**（约 560–997 字符），而非原先假设的 500 字节。
 - **请 Carbon 建议**：
   - 应当通过直接解析 `CHECKPOINT` 记录中的 `<truncated \d+ bytes>` 标记来精确标记哪些历史输入被截断，还是结合 `~1000 bytes` 阈值做双重判定？

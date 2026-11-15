@@ -34,14 +34,16 @@
 ```text
 anti-compaction-amnesia/
 ├── SKILL.md                              # 技能主说明文件（触发条件、三道防线工作流、CLI 速查与硬约束）
-├── README.md                             # 项目说明与已知问题概览（本文档）
-├── REVIEW_ISSUES.md                      # 完整代码审查报告与待 Carbon 评审的设计问题清单
+├── README.md                             # 项目说明与修复概览（本文档）
+├── REVIEW_ISSUES.md                      # 完整代码审查报告、问题状态（✅ 35/35 已解决）与架构总结
 ├── .gitignore                            # Git 忽略规则
 ├── references/
 │   └── memory_anchor_template.md         # MEMORY_ANCHOR.md 五大必填区块标准模板
-└── scripts/
-    ├── context_guardian.py               # 核心 CLI 工具（status / init-anchor / recover / search / step / hook）
-    └── pre_invocation_guard.py           # Antigravity PreInvocation 生命周期自动防护钩子
+├── scripts/
+│   ├── context_guardian.py               # 核心 CLI 工具（status / init-anchor / recover / search / step / hook）
+│   └── pre_invocation_guard.py           # Antigravity PreInvocation 生命周期自动防护钩子
+└── tests/
+    └── test_fixes.py                     # 覆盖核心缺陷与重构逻辑的单元/集成回归测试
 ```
 
 | 文件路径 | 核心职责 |
@@ -50,7 +52,8 @@ anti-compaction-amnesia/
 | [`scripts/context_guardian.py`](./scripts/context_guardian.py) | 纯 Python 标准库实现的 CLI 工具箱：检查上下文 Token 水位、初始化记忆锚点、无损恢复被截断的用户输入、正则/关键词搜索历史步骤、按 `step_index` 精准调阅、管理全局 `hooks.json`。 |
 | [`scripts/pre_invocation_guard.py`](./scripts/pre_invocation_guard.py) | 挂载于 `~/.gemini/config/hooks.json` 的 `PreInvocation` 钩子脚本，基于 `.compaction_guard_state.json` 实现边沿触发（高水位预警 + 压缩后自动注入恢复包），任何异常静默输出 `{}` 并以退出码 `0` 放行。 |
 | [`references/memory_anchor_template.md`](./references/memory_anchor_template.md) | `MEMORY_ANCHOR.md` 模板，规范化记录负面约束、精确路径/参数、死胡同清单、当前状态与历史 `USER_INPUT` 索引。 |
-| [`REVIEW_ISSUES.md`](./REVIEW_ISSUES.md) | 针对当前代码实现（保持原行号不变）的完整静态与实测审查报告，汇总 **5 项 HIGH、10 项 MEDIUM、17 项 LOW/INFO** 问题及复现证据，供 Carbon 深入审查与提出改进建议。 |
+| [`REVIEW_ISSUES.md`](./REVIEW_ISSUES.md) | 完整静态与实测审查报告，汇总 **5 项 HIGH、10 项 MEDIUM、20 项 LOW/INFO/文档** 问题（已逐条标注 `✅ 已解决`，共 **35/35**）与第 5 节修复总结。 |
+| [`tests/test_fixes.py`](./tests/test_fixes.py) | 针对已修复缺陷的单元与集成回归测试套件。 |
 
 ---
 
@@ -124,27 +127,27 @@ python "$HOME/.gemini/config/skills/anti-compaction-amnesia/scripts/context_guar
 | **M8** | `scripts/context_guardian.py` | **多宿主 Brain 根目录自动探测**：支持 `$AGY_BRAIN_ROOT`、命令行 `--brain-root` 以及 CLI/IDE 目录自动探测。 | ✅ 已修复 |
 | **MED-3 / LOW-4** | `scripts/pre_invocation_guard.py` | **二进制安全切行与边界读取**：严格按 `b"\n"` 分割防 `U+0085` (NEL) 误断行，边界多读 1 字节准确丢弃残行。 | ✅ 已修复 |
 
-### 4.2 低风险与信息项汇总（LOW / INFO — 共 17 项 + 文档同步项）
+### 4.2 低风险与信息项汇总（LOW / INFO — 共 17 项 + 文档同步项，✅ 全部已解决）
 
 - **`context_guardian.py`（11 项：`L1`–`L11`）**：
-  - **L1** (`L230`)：`records_since` 将有效记录数 `len(records)` 与文件物理行号 `last_line` 混减。
-  - **L2** (`L142`)：`iter_jsonl_records` 静默跳过损坏 JSON 行但未在 `status` 中统计报告。
-  - **L3** (`L178, L266`)：当 `transcript_full.jsonl` 缺失回退到有损 `transcript.jsonl` 时未打印警告。
-  - **L4** (`L387-L399, L509, L657`)：`--type` 缺少 `ERROR_MESSAGE` 选项，`search` 与 `step` 未检索/展示 `error` 字段。
-  - **L5** (`L653`)：`search` 搜索以 `-` 开头的关键词（如 `-rf`）时被 `argparse` 误判为选项。
-  - **L6** (`L520, L555`)：`init-anchor --force` 直接覆盖已有锚点文件，无 `.bak` 备份与原子写入。
-  - **L7** (`L94-L97`)：`resolve_brain_dir` 未校验 `conversation_id` 格式，传入 `..` 可越界访问父目录。
-  - **L8** (`L350-L354, L366-L373`)：`recover` 模型快照硬编码 600/800 字符截断而忽略 `--max-chars`，无压缩分支仅展示 `content`。
-  - **L9** (`L470-L515`)：`step` 默认 `--max-chars 0`（不截断），大范围查询多步时会向终端倾倒数 MB 内容。
-  - **L10** (`L592-L628`)：`hook` 子命令未设互斥参数组与默认动作，且 `--enable` 会覆盖用户自定义的 `timeout`。
-  - **L11** (`L250, L555`)：`.encode("utf-8")` 与文件写入未指定 `errors="replace"`，遇到孤立代理项（surrogates）存在编码异常风险。
+  - ✅ **L1** (`L230`)：`records_since` 改为基于有效记录列表下标差计算，不再混用物理行号。
+  - ✅ **L2** (`L142`)：`iter_jsonl_records` 统计损坏/空行跳过数量并在 `status` 中报告。
+  - ✅ **L3** (`L178, L266`)：缺失 `transcript_full.jsonl` 回退到有损 `transcript.jsonl` 时向 `stderr` 打印警告。
+  - ✅ **L4** (`L387-L399, L509, L657`)：`--type` 已支持 `ERROR_MESSAGE`，`search` 与 `step` 已检索并展示 `error` 字段。
+  - ✅ **L5** (`L653`)：`search` 帮助文案与 `SKILL.md` 已补充 `--` 分隔符用法说明（`search -- "-rf"`）。
+  - ✅ **L6** (`L520, L555`)：`init-anchor --force` 覆盖前自动创建 `.bak` 备份并使用 `.tmp` + `os.replace` 原子写入。
+  - ✅ **L7** (`L94-L97`)：`resolve_brain_dir` 已校验 `conversation_id` 格式并禁止路径穿越。
+  - ✅ **L8** (`L350-L354, L366-L373`)：`recover` 第 4 节尊重 `--max-chars`，无压缩分支同样展示 `thinking` 与 `tool_calls`。
+  - ✅ **L9** (`L470-L515`)：`step` 查询超过 3 步且未显式限制时默认应用每字段 4,000 字符安全上限（`--max-chars -1` 可取消）。
+  - ✅ **L10** (`L592-L628`)：`hook` 已改为互斥参数组并默认 `--status`，保留用户自定义 `timeout` 等字段。
+  - ✅ **L11** (`L250, L555`)：UTF-8 编解码与文件写入已统一指定 `errors="replace"`。
 - **`pre_invocation_guard.py` 与 `SKILL.md`（6 项 LOW/INFO + 文档同步项）**：
-  - **LOW-4** (`pre_invocation_guard.py:L58-L60`)：当 `start = size - tail_bytes` 恰好落在行首边界时，`lines[1:]` 会无条件丢弃第一条完整记录。
-  - **LOW-6** (`pre_invocation_guard.py:L426`)：钩子标准输出 `json.dumps` 使用 `ensure_ascii=False`，在非 UTF-8 管道下不如 `ensure_ascii=True` 稳健。
-  - **LOW-7** (`pre_invocation_guard.py:L395-L403`)：90 秒 `MEMORY_ANCHOR.md` 免打扰窗口检查位于更新 `last_warned_band` 之后，导致高水位预警被静默吞掉且不再重发。
-  - **LOW-8** (`pre_invocation_guard.py:L388-L391`)：缺少向下重置迟滞区间（hysteresis），且当末尾无 Token 记录（`latest_tokens == 0`）时会错误重置 `last_warned_band = 0`。
-  - **LOW-9** (`pre_invocation_guard.py:L126-L129, L189, L374-L376`)：当 `CHECKPOINT` 超出 `transcript_full.jsonl` 末尾 4 MB 窗口时，`ckpt_pos = -1` 会把压缩后的最新 `PLANNER_RESPONSE` 误标为“压缩前快照”；回退到 `transcript.jsonl` 时仍声称“无损恢复”。
-  - **LOW-10 & LOW-11** (`pre_invocation_guard.py:L110, L349-L352`)：状态文件写入非原子操作；同时 `transcript.jsonl` 中的 Token 计数反映上一轮模型调用，滞后于本轮新产生的工具输出。
-  - **INFO-12 & `SKILL.md` (`L108, L110, L124`)**：需实测确认宿主引擎生成 `CHECKPOINT` 与触发 `PreInvocation` 的先后时序；`SKILL.md` 中关于“只扫描末尾 ≤256 KB”及状态文件路径的表述需与实际实现对齐。
+  - ✅ **LOW-4** (`pre_invocation_guard.py`)：从文件末尾 seek 时多回退 1 字节并精确跳过首个 `b"\n"`，消除边界整行丢失。
+  - ✅ **LOW-6** (`pre_invocation_guard.py`)：`main()` 改为 `json.dumps(..., ensure_ascii=True)` 输出纯 ASCII JSON，免疫代码页乱码。
+  - ✅ **LOW-7** (`pre_invocation_guard.py`)：免打扰窗口检查移至更新 `last_warned_band` 之前，且 CRITICAL 级缩短至 30 秒。
+  - ✅ **LOW-8** (`pre_invocation_guard.py`)：仅在检测到有效 token（`latest_tokens > 0`）且水位回落时才重置 `last_warned_band`。
+  - ✅ **LOW-9** (`pre_invocation_guard.py`)：`ckpt_pos < 0` 时不再误将压缩后回复当成压缩前快照，有损回退已显式标注。
+  - ✅ **LOW-10 & LOW-11** (`pre_invocation_guard.py` & `SKILL.md`)：状态文件改为 `.tmp` + `os.replace` 原子写入，并在文档补充滞后说明。
+  - ✅ **INFO-12 & `SKILL.md`** (`SKILL.md` & `README.md`)：`SKILL.md` 已同步真实截断阈值、尾部扫描与按需读全量规则以及真实状态文件路径。
 
-👉 **完整审查细节、复现脚本结果与待讨论架构议题请参阅 [`REVIEW_ISSUES.md`](./REVIEW_ISSUES.md)。**
+👉 **完整审查细节、逐条解决状态与第 5 节修复总结请参阅 [`REVIEW_ISSUES.md`](./REVIEW_ISSUES.md)。**
