@@ -1,0 +1,13 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Backup and temporary files
+*.bak
+*.tmp
+.compaction_guard_state.json
+
+# OS metadata
+.DS_Store
+Thumbs.db
