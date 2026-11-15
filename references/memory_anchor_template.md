@@ -45,6 +45,6 @@
 
 ## 5. 关键历史步骤索引 (Transcript Step Bookmarks)
 <!-- 记录 transcript_full.jsonl 中不可压缩的原始长文本所在 step_index，便于用 context_guardian.py step / search 秒级无损调取 -->
-| `step_index` | 类型 | 摘要说明（含被 >500B 截断的长用户输入 / 关键报错 / 关键输出） |
+| `step_index` | 类型 | 摘要说明（含被 >1000B 截断的长用户输入 / 关键报错 / 关键输出） |
 |---|---|---|
 | `...` | `USER_INPUT` / `GENERIC` | `...` |

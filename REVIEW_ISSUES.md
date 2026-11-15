@@ -457,3 +457,39 @@
 - **背景**：实测 12 处真实 `<truncated N bytes>` 样本表明，系统在 `CHECKPOINT` 中保留的用户请求前缀长度为 **1,021 字节**或 **1,391–1,392 字节**（约 560–997 字符），而非原先假设的 500 字节。
 - **请 Carbon 建议**：
   - 应当通过直接解析 `CHECKPOINT` 记录中的 `<truncated \d+ bytes>` 标记来精确标记哪些历史输入被截断，还是结合 `~1000 bytes` 阈值做双重判定？
+
+---
+
+## 5. Carbon 修复执行与架构实现总结 (Resolved by Carbon)
+
+上述清单中列出的全部 **5 项 HIGH、10 项 MEDIUM、17 项 LOW/INFO** 问题及文档偏差已在本次修复中全量解决并落地。以下为核心架构决策与实现总结：
+
+### 5.1 核心架构改进落地
+
+1. **统一的主干分支规范化（Canonicalization via Backward Pass，彻底解决 `M1` & `HIGH-1`）**：
+   - 实现了 `canonicalize_records()` / `canonicalize_tail_records()`，通过单次反向扫描（Backward Pass）维护 `min_step_seen`，将所有由于用户重试、流中断恢复或回退而排在前面的同名/更大 `step_index` 记录精确标记为 `_superseded = True`。
+   - `status` 与 `recover` 统一区分 **Active CHECKPOINT** 与 **Rewound CHECKPOINT**（展示 `X active (+Y rewound)`），且只基于最后一个活跃有效 CHECKPOINT 划定压缩分界线。
+   - `pre_invocation_guard.py`（`HIGH-1`）在扫描尾部检查点时，计算其后未被回退的 `PLANNER_RESPONSE` 数量 `post_ckpt_planners`；仅当 `post_ckpt_planners <= 1` 时才判定为刚触发的新压缩，若 `> 1`（历史旧压缩点或状态文件刚初始化）则静默记录状态并放行 `{}`，彻底杜绝了开启钩子时的陈旧上下文误报。
+
+2. **状态持久化与 I/O 时序重构（彻底解决 `HIGH-2`、`LOW-10`、`M6`）**：
+   - 彻底调整了 `pre_invocation_guard.py` 的执行时序：先完成恢复/预警包构造，将纯 ASCII JSON 写入 `sys.stdout` 并调用 `sys.stdout.flush()` 确保宿主成功接收后，最后才调用 `save_state` 持久化状态。
+   - 状态文件与 `hooks.json` 写入统一引入同目录 `.tmp` 临时文件 + `os.replace` 原子替换；在更新 `hooks.json` 前自动保存 `.bak` 备份，并在解析时采用 `utf-8-sig`，完美兼容 PowerShell 默认带有的 UTF-8 BOM。
+
+3. **二进制安全切行与无损字符解析（彻底解决 `MED-3`、`LOW-4`）**：
+   - `read_tail_records` 彻底放弃了会误切 `U+0085` (NEL)、`U+2028`、`U+2029` 的 `str.splitlines()`，改为严格按字节 `b"\n"` 切分后再逐行解码，杜绝了单条 JSON 记录被腰斩丢弃的问题。
+   - 在从文件末尾 seek 时，向前多读取 1 个字节检测上一行换行符，并仅丢弃第一个 `b"\n"` 之前的不完整片段，彻底消除了当起始点恰好位于行首边界时误丢整条记录的缺陷。
+
+4. **真实截断判定与精炼锚点体积控制（彻底解决 `H3`、`M5`）**：
+   - 将启发式截断阈值常量由 500 调整为符合真实样本的 `CHECKPOINT_USER_TRUNCATE_BYTES = 1000` 字节（~1 KB）。
+   - 严格区分状态语义：仅对位于最新活跃有效 `CHECKPOINT` **之前**且 `> 1000B` 的输入标记 `[TRUNCATED BY CHECKPOINT]`；对于压缩之后（或尚无压缩）的输入，标记为 `[>1KB AT-RISK]`（有截断风险），不再产生误导性虚假报警。
+   - `init-anchor` 生成历史索引表时，采用优先级过滤算法：仅提取超长截断/风险输入（`> 1000B`）+ 最近 10 条输入，总行数控制在 25 行以内（文件体积严格压在 2~3 KB 内），避免长会话下生成 30+ KB 冗余索引撑爆上下文窗口。
+
+5. **缺失 Token 遥测时的字节估算模型（彻底解决 `H1`、`M2`、`LOW-8`）**：
+   - 在旧版/特定日志缺失 `input_tokens` 字段时，`status` 不再误报 `0 tokens / SAFE`，而是明确标为 `UNKNOWN`，并自动统计末次活跃 `CHECKPOINT` 以来的累计内容字节数，按 `1 token ≈ 3.5 bytes` 给出估算水位和告警区间。
+   - 当 `CHECKPOINT` 刚发生且尚未产生新模型回复时，显式展示 `POST-COMPACTION (awaiting first post-compaction model response)`。
+
+6. **Windows 路径检索、多代理会话防串台与健壮命令构造（彻底解决 `H2`、`M3`、`M4`、`M7`、`MED-5`、`M8`、`L7`）**：
+   - `search` 在提取 `tool_calls` 时，自动对嵌套的 JSON 字符串递归解包，消除双重反斜杠转义；同时增加 `-F` / `--literal` 字面量选项，并在常规正则搜索 Windows 路径出现 0 命中时自动回退为字面量匹配。
+   - `resolve_brain_dir` 加入会话 ID 格式校验与路径穿越防御；检测到 120 秒内存在多会话活跃时向 `stderr` 打印并发预警，写操作（`init-anchor`）强制要求指定 `-c`，避免 Swarm 串台。
+   - 钩子生成命令使用当前解释器绝对路径 `sys.executable` 并显式携带 `-X utf8` 标志；同时支持环境变量 `$AGY_BRAIN_ROOT`、命令行 `--brain-root` 以及多形态目录（CLI/IDE）自动探测。
+

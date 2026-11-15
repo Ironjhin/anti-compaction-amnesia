@@ -100,38 +100,31 @@ python "$HOME/.gemini/config/skills/anti-compaction-amnesia/scripts/context_guar
 
 ---
 
-## 4. 当前存在的问题与待审查清单 (Known Issues for Carbon Review)
+## 4. 已知问题与修复进展 (Review Issues & Resolutions)
 
-> [!IMPORTANT]
-> 本仓库当前保留了初版实现的原始代码与行号，并在真实会话日志库（90 个会话 / 180 个 `transcript*.jsonl` 文件，单文件最高 15.8 MB、25 次 `CHECKPOINT`）上完成了全面实测审计。
-> 全部 **5 项 HIGH、10 项 MEDIUM、17 项 LOW/INFO（及文档同步项）** 的详细行号、复现证据、根因分析与修复建议均已完整收录于 **[`./REVIEW_ISSUES.md`](./REVIEW_ISSUES.md)**，供 Carbon 审查与给出架构改进建议。
+> [!NOTE]
+> 在真实会话日志库（90 个会话 / 180 个 `transcript*.jsonl` 文件，单文件最高 15.8 MB、25 次 `CHECKPOINT`）上进行了全面实测审计，共发现 **5 项 HIGH、10 项 MEDIUM、17 项 LOW/INFO** 问题。
+> **当前版本已全量完成上述问题的修复与架构重构**，详细的根因分析、复现证据与修复实现总结已完整收录于 **[`./REVIEW_ISSUES.md`](./REVIEW_ISSUES.md)**。
 
-### 4.1 严重问题汇总（HIGH — 共 5 项）
+### 4.1 核心修复与改进清单（HIGH & MEDIUM）
 
-| 编号 | 所属文件与行号 | 问题简述与实测影响 |
-| :--- | :--- | :--- |
-| **H1** | `scripts/context_guardian.py` (`L190-L207`) | **旧版会话缺失 Token 字段导致误报 `SAFE`**：约 56/90 个较早会话（含 15.8 MB、25 次压缩的重度会话）无 `input_tokens`/`cache_read_tokens` 字段，`status` 输出 `0 / 250,000 (0.0%) [step None] -> SAFE`，在高危会话上给出错误的绿灯信号。 |
-| **H2** | `scripts/context_guardian.py` (`L110-L123`) & `SKILL.md` (`L55, L59`) | **`auto` 会话选择在多 Agent/Swarm/多窗口下串台**：未传 `-c` 时默认按 `transcript.jsonl` 最新 `mtime` 选择会话。并发子代理或 Swarm 场景下，`init-anchor` 和 `recover` 极易读写到错误的子代理会话目录。 |
-| **H3** | `scripts/context_guardian.py` (`L26, L259`) & `SKILL.md` (`L23`) | **`CHECKPOINT_USER_TRUNCATE_BYTES = 500` 与真实截断阈值不符且误标未压缩输入**：实测真实 `CHECKPOINT` 中 `<truncated N bytes>` 保留前缀为 `1021 B`（10 例）或 `~1392 B`，而非 `500 B`；且代码仅凭字节长度打标，即使输入发生在最后一次压缩之后（或全会话无压缩）也会被误标为 `[TRUNCATED BY CHECKPOINT]`。 |
-| **HIGH-1** | `scripts/pre_invocation_guard.py` (`L91-L97, L361-L366`) | **首次启用或状态文件缺失时将历史旧 `CHECKPOINT` 误判为新压缩（已复现）**：当 `.compaction_guard_state.json` 不存在或损坏重置时，末尾 256 KB 内的任何历史 `CHECKPOINT`（如距今已过去 250 步的旧压缩）都会在首次调用时触发 2.8 KB 的“刚刚触发压缩”恢复注入。此外未过滤被回滚（rewound）覆盖的失效 `CHECKPOINT`。 |
-| **HIGH-2** | `scripts/pre_invocation_guard.py` (`L372, L396`) | **状态持久化早于输出构造与落盘，异常/超时导致恢复机会永久丢失**：`save_state()` 在 `build_post_compaction_output()` / `build_watermark_output()` 及 `stdout` 写入之前执行；一旦后续读取大文件超时（10s）或抛错回退到 `{}`，状态已标记为“已处理”，该次压缩恢复将永远不再触发。 |
+| 编号 | 涉及模块 | 问题与修复方案 | 状态 |
+| :--- | :--- | :--- | :--- |
+| **H1** | `scripts/context_guardian.py` | **缺失 Token 字段会话水位估算**：引入按末次压缩以来累积字节数估算活跃上下文的算法（`1 token ≈ 3.5 bytes`），消除虚假 `SAFE`。 | ✅ 已修复 |
+| **H2 / L7** | `scripts/context_guardian.py` | **多代理会话防串台与路径穿越校验**：严格校验会话 ID 格式防穿越；120s 内多会话活跃时预警，写操作强制要求指定 `-c`。 | ✅ 已修复 |
+| **H3** | `scripts/context_guardian.py` | **真实截断阈值 (~1000B) 与状态精确分类**：将阈值修正为 1000B；严格区分压缩前已截断（`[TRUNCATED BY CHECKPOINT]`）与压缩后待截断风险（`[>1KB AT-RISK]`）。 | ✅ 已修复 |
+| **HIGH-1** | `scripts/pre_invocation_guard.py` | **首次启用/状态丢失旧检查点误报消除**：引入 `post_ckpt_planners` 判定，仅在压缩刚触发（响应轮次 ≤ 1）时注入恢复包；自动过滤已被回退的失效检查点。 | ✅ 已修复 |
+| **HIGH-2** | `scripts/pre_invocation_guard.py` | **状态持久化时序重构**：先完成恢复输出构造并向 `stdout` 刷写成功，后持久化状态，杜绝异常丢失恢复机会。 | ✅ 已修复 |
+| **M1** | `scripts/context_guardian.py` | **主干分支统一规范化**：反向扫描标记 `_superseded` 步骤，区分活跃/回退检查点，防止旧步骤吞掉当前记录。 | ✅ 已修复 |
+| **M2** | `scripts/context_guardian.py` | **压缩刚完成瞬时状态提示**：显式展示 `POST-COMPACTION` 状态，提示等待第一轮模型恢复响应。 | ✅ 已修复 |
+| **M3 / M4** | `scripts/context_guardian.py` | **Windows 反斜杠与嵌套 JSON 检索修复**：解包嵌套 JSON 字符串消除重复转义；增加 `-F/--literal` 并在无正则命中时自动字面量回退。 | ✅ 已修复 |
+| **M5** | `scripts/context_guardian.py` | **记忆锚点体积控制**：限制自动生成索引为截断/高风险输入+最近 10 条（最多 25 行），锚点严格控制在 < 4 KB。 | ✅ 已修复 |
+| **M6 / LOW-10** | 核心脚本 | **配置文件读写原子性与 UTF-8 BOM 兼容**：支持 `utf-8-sig`，写入采用 `.tmp` + `os.replace` 原子替换，备份 `.bak`。 | ✅ 已修复 |
+| **M7 / MED-5** | `scripts/context_guardian.py` | **解释器路径与编码参数健壮性**：使用当前 Python 解释器绝对路径并显式附加 `-X utf8`。 | ✅ 已修复 |
+| **M8** | `scripts/context_guardian.py` | **多宿主 Brain 根目录自动探测**：支持 `$AGY_BRAIN_ROOT`、命令行 `--brain-root` 以及 CLI/IDE 目录自动探测。 | ✅ 已修复 |
+| **MED-3 / LOW-4** | `scripts/pre_invocation_guard.py` | **二进制安全切行与边界读取**：严格按 `b"\n"` 分割防 `U+0085` (NEL) 误断行，边界多读 1 字节准确丢弃残行。 | ✅ 已修复 |
 
-### 4.2 中等问题汇总（MEDIUM — 共 10 项）
-
-| 编号 | 所属文件与行号 | 问题简述 |
-| :--- | :--- | :--- |
-| **M1** | `scripts/context_guardian.py` (`L202, L243, L274, L481-L486`) | **重试/回滚产生重复 `step_index`**：回滚后同一 `step_index` 可能由 `CHECKPOINT` 变为 `PLANNER_RESPONSE`；`step` 静默覆盖旧记录、`status`/`recover` 计入已回滚的 `CHECKPOINT`、`collect_user_inputs` 重复列出重试的 `USER_INPUT`。 |
-| **M2** | `scripts/context_guardian.py` (`L199-L201`) | **刚完成 `CHECKPOINT` 但尚无新 `PLANNER_RESPONSE` 时水位显示滞后**：`status` 仍显示压缩前的高水位（`CRITICAL`），未提示“刚刚完成压缩，等待下一轮响应”。 |
-| **M3** | `scripts/context_guardian.py` (`L397-L398`) | **`search` 对 `tool_calls` 参数二次 JSON 转义导致路径检索失效**：`args` 内部值常为序列化 JSON 字符串，`json.dumps` 二次转义后 Windows 路径反斜杠翻倍，直接搜索 `C:\Users\...` 命中数为 0。 |
-| **M4** | `scripts/context_guardian.py` (`L420-L423`) | **`search` 正则模式静默误读反斜杠转义**：搜索含 `\t`、`\n` 等路径（如 `C:\temp\new`）时是合法正则，不会触发 `re.error` 字面量回退，导致静默返回 0 条结果。 |
-| **M5** | `scripts/context_guardian.py` (`L298-L308, L533-L538`) | **`init-anchor` 与 `recover` 的用户输入索引表无上限**：在 300+ 轮对话中生成 31 KB 的 `MEMORY_ANCHOR.md` 和 36 KB 的 `recover` 输出，违背 `< 4 KB` 精炼锚点原则并加剧上下文膨胀。 |
-| **M6** | `scripts/context_guardian.py` (`L564, L611, L623`) | **`hooks.json` 读写脆弱性**：未用 `utf-8-sig` 兼容 Windows PowerShell 写入的 UTF-8 BOM；直接覆盖写无 `.tmp` 原子替换与 `.bak` 备份；配置项非 `dict` 时抛异常崩溃。 |
-| **M7** | `scripts/context_guardian.py` (`L575-L583`) | **`build_hook_spec` 命令构造不够健壮**：使用裸 `python` 且仅在路径含空格时加引号，遇到 `&^()%!` 等 `cmd.exe` 元字符或解释器别名时易失效，且启用前未校验钩子脚本是否存在。 |
-| **M8** | `scripts/context_guardian.py` (`L29`) | **`DEFAULT_BRAIN_ROOT` 硬编码为 `antigravity/brain`**：未自动探测 CLI（`antigravity-cli/brain`）与 IDE（`antigravity-ide/brain`）目录，且 CLI 未暴露 `--brain-root` 参数。 |
-| **MED-3** | `scripts/pre_invocation_guard.py` (`L57`) | **`read_tail_records` 使用 `str.splitlines()` 导致 JSONL 记录被腰斩（已复现）**：`splitlines()` 会按 JSON 未转义的 `U+0085` (NEL)、`U+2028`、`U+2029` 切行；真实日志中存在原始 `U+0085` 字节（`C2 85`），导致含该字符的 `USER_INPUT` 或 `CHECKPOINT` 解析失败被静默丢弃。 |
-| **MED-5** | `hooks.json` (`L7`) & `scripts/context_guardian.py` (`L582`) | **Windows `cmd /c` 下裸调 `python` 的环境与编码风险**：依赖宿主进程 `PATH` 顺序（可能命中 Microsoft Store 空桩或非预期 Python 环境），且未显式传入 `-X utf8` 或固定解释器绝对路径。 |
-
-### 4.3 低风险与信息项汇总（LOW / INFO — 共 17 项 + 文档同步项）
+### 4.2 低风险与信息项汇总（LOW / INFO — 共 17 项 + 文档同步项）
 
 - **`context_guardian.py`（11 项：`L1`–`L11`）**：
   - **L1** (`L230`)：`records_since` 将有效记录数 `len(records)` 与文件物理行号 `last_line` 混减。

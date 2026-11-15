@@ -17,6 +17,7 @@ never blocks or breaks the agent execution loop.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -42,33 +43,60 @@ FULL_READ_LIMIT_BYTES = 2 * 1024 * 1024  # Read whole transcript_full.jsonl if <
 FULL_TAIL_BYTES = 1024 * 1024  # Otherwise read last 1 MB (expandable to 4 MB)
 FULL_FALLBACK_TAIL_BYTES = 4 * 1024 * 1024
 ANCHOR_RECENT_GRACE_SEC = 90.0
+ANCHOR_CRITICAL_GRACE_SEC = 30.0
 
 
 def read_tail_records(path: Path, tail_bytes: int) -> List[Dict[str, Any]]:
-    """Read and parse JSONL lines from the last `tail_bytes` of `path`."""
+    """Read and parse JSONL lines from the last `tail_bytes` of `path`.
+
+    Splits strictly on byte newline `b'\\n'` (not Unicode linebreaks like U+0085)
+    and cleanly handles file-boundary seek offsets (MED-3, LOW-4).
+    """
     if not path.is_file():
         return []
     size = path.stat().st_size
-    start = max(0, size - tail_bytes)
+    if size == 0:
+        return []
+
     with path.open("rb") as fh:
-        fh.seek(start)
-        raw = fh.read()
-    text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    if start > 0 and lines:
-        # Drop the first partial line when seeking mid-file
-        lines = lines[1:]
+        if size > tail_bytes:
+            # LOW-4: Seek 1 byte earlier so we can reliably detect the preceding newline
+            fh.seek(size - tail_bytes - 1)
+            raw = fh.read()
+            nl = raw.find(b"\n")
+            raw = raw[nl + 1 :] if nl != -1 else b""
+        else:
+            raw = fh.read()
+
+    # MED-3: Split on b"\n" instead of str.splitlines() to avoid breaking on U+0085/U+2028/U+2029
+    raw_lines = raw.split(b"\n")
     records: List[Dict[str, Any]] = []
-    for line in lines:
-        s = line.strip()
-        if not s:
+    for raw_line in raw_lines:
+        line_str = raw_line.decode("utf-8", errors="replace").strip()
+        if not line_str:
             continue
         try:
-            obj = json.loads(s)
+            obj = json.loads(line_str)
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
             records.append(obj)
+    return records
+
+
+def canonicalize_tail_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Tag superseded/rewound steps in tail records via backward pass."""
+    min_step_seen = float("inf")
+    for rec in reversed(records):
+        step_idx = rec.get("step_index")
+        if isinstance(step_idx, int):
+            if step_idx >= min_step_seen:
+                rec["_superseded"] = True
+            else:
+                rec["_superseded"] = False
+                min_step_seen = step_idx
+        else:
+            rec["_superseded"] = False
     return records
 
 
@@ -105,9 +133,18 @@ def load_state(state_path: Path) -> Dict[str, Any]:
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
-    """Persist edge-trigger state atomically enough for single-turn hooks."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Persist edge-trigger state atomically via .tmp and os.replace (LOW-10)."""
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = state_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+            errors="replace",
+        )
+        os.replace(tmp_path, state_path)
+    except Exception:
+        pass
 
 
 def clip(text: str, limit: int) -> str:
@@ -174,24 +211,29 @@ def extract_compaction_recovery_bundle(
         if dedup_key in seen_dedup:
             continue
         seen_dedup.add(dedup_key)
-        utf8_bytes = len(prompt.encode("utf-8"))
+        utf8_bytes = len(prompt.encode("utf-8", errors="replace"))
+
+        is_before_ckpt = (ckpt_pos >= 0) and (pos < ckpt_pos)
+        is_truncated = is_before_ckpt and (utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES)
         recovered_inputs.append(
             {
                 "step_index": rec.get("step_index"),
                 "created_at": rec.get("created_at", ""),
                 "bytes": utf8_bytes,
-                "truncated_in_checkpoint": utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES,
+                "truncated_in_checkpoint": is_truncated,
+                "at_risk": (not is_before_ckpt) and (utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES),
                 "prompt": clip(prompt, 4000),
             }
         )
 
+    # LOW-9: Only look for pre_planner if ckpt_pos was found in window
     pre_planner: Optional[Dict[str, Any]] = None
-    search_end = ckpt_pos if ckpt_pos >= 0 else len(records)
-    for pos in range(search_end - 1, -1, -1):
-        rec = records[pos]
-        if rec.get("type") == "PLANNER_RESPONSE":
-            pre_planner = rec
-            break
+    if ckpt_pos >= 0:
+        for pos in range(ckpt_pos - 1, -1, -1):
+            rec = records[pos]
+            if rec.get("type") == "PLANNER_RESPONSE":
+                pre_planner = rec
+                break
 
     return recovered_inputs, pre_planner
 
@@ -202,15 +244,18 @@ def build_post_compaction_output(
     full_path: Path,
     ckpt_step: int,
     ckpt_key: str,
+    is_lossy_source: bool = False,
 ) -> Dict[str, Any]:
     """Construct injectSteps JSON after a newly detected CHECKPOINT compaction."""
     recovered_inputs, pre_planner = extract_compaction_recovery_bundle(full_path, ckpt_key)
     anchor_path = artifact_dir / "MEMORY_ANCHOR.md"
     guardian_posix = (SCRIPT_DIR / "context_guardian.py").as_posix()
 
+    source_desc = "transcript.jsonl (有损回退)" if is_lossy_source else "transcript_full.jsonl"
+
     sections: List[str] = [
         f"[ANTI-COMPACTION GUARD] 检测到当前会话刚刚在 step_index={ckpt_step} 触发了有损上下文压缩 (CHECKPOINT)。",
-        "严禁仅凭压缩摘要 `<summary>` 或被截断至 ~500B 的 `# User Requests` 猜测细节；以下是从磁盘无损恢复的关键记忆：",
+        "严禁仅凭压缩摘要 `<summary>` 或被截断至 ~1000B 的 `# User Requests` 猜测细节；以下是从磁盘无损恢复的关键记忆：",
         "",
     ]
 
@@ -232,10 +277,15 @@ def build_post_compaction_output(
             ]
         )
 
-    sections.append("### 2. 从 `transcript_full.jsonl` 无损恢复的近期/压缩前完整用户输入")
+    sections.append(f"### 2. 从 `{source_desc}` 恢复的近期/压缩前完整用户输入")
     if recovered_inputs:
         for item in recovered_inputs:
-            trunc_note = " [CHECKPOINT已截断此输入(>500B)]" if item["truncated_in_checkpoint"] else ""
+            trunc_note = ""
+            if item["truncated_in_checkpoint"]:
+                trunc_note = " [CHECKPOINT已截断此输入(>1KB)]"
+            elif item.get("at_risk"):
+                trunc_note = " [>1KB 易截断]"
+
             sections.append(
                 f"- **USER_INPUT step={item['step_index']}** ({item['created_at']}, {item['bytes']} bytes){trunc_note}:"
             )
@@ -271,7 +321,7 @@ def build_post_compaction_output(
 
     user_md = (
         f"> 🛡️ **防失忆护盾 (Anti-Compaction Guard)**：检测到会话刚触发有损压缩（Step #{ckpt_step}），"
-        f"已自动从 `transcript_full.jsonl` 与 `MEMORY_ANCHOR.md` 无损恢复完整用户输入与核心记忆锚点。"
+        f"已自动从 `{source_desc}` 与 `MEMORY_ANCHOR.md` 无损恢复完整用户输入与核心记忆锚点。"
     )
     return {
         "injectSteps": [
@@ -300,7 +350,7 @@ def build_watermark_output(
     sys_msg = "\n".join(
         [
             f"[CONTEXT WATERMARK {level}] 当前上下文已达 {latest_tokens:,} / {COMPACTION_THRESHOLD_TOKENS:,} tokens ({pct:.1f}%)。",
-            "Antigravity 即将或很快会在 ~250k tokens 触发有损 CHECKPOINT 压缩（仅保留泛化摘要，且历史用户输入将被截断至 ~500 字节）。",
+            "Antigravity 即将或很快会在 ~250k tokens 触发有损 CHECKPOINT 压缩（仅保留泛化摘要，且历史用户输入将被截断至 ~1000 字节）。",
             f"请立即创建或更新 `{anchor_path}`，确保以下 5 项完整固化（如尚未初始化可先运行 `init-anchor`）：",
             "1. 铁律与负面约束（用户禁止事项、不可改动的文件/参数）",
             "2. 精确事实与参数账本（绝对路径、偏移量、命令、精确指标）",
@@ -326,89 +376,125 @@ def build_watermark_output(
     }
 
 
-def run_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Evaluate PreInvocation payload and return hook response dict."""
+def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[Path, Dict[str, Any]]]]:
+    """Evaluate PreInvocation payload.
+
+    Returns:
+        (response_dict, optional_state_to_persist)
+        HIGH-2: State is only persisted after output construction succeeds.
+    """
     transcript_str = payload.get("transcriptPath")
     artifact_str = payload.get("artifactDirectoryPath")
     conversation_id = str(payload.get("conversationId") or "auto")
     if not transcript_str or not artifact_str:
-        return {}
+        return {}, None
 
     transcript_path = Path(transcript_str)
     artifact_dir = Path(artifact_str)
     if not transcript_path.is_file():
-        return {}
+        return {}, None
 
     tail_records = read_tail_records(transcript_path, TAIL_BYTES)
     if not tail_records:
-        return {}
+        return {}, None
+
+    canonicalize_tail_records(tail_records)
 
     latest_tokens = 0
     latest_checkpoint: Optional[Dict[str, Any]] = None
-    for rec in tail_records:
+    last_ckpt_idx: Optional[int] = None
+
+    for idx, rec in enumerate(tail_records):
+        if rec.get("_superseded"):
+            continue
         if rec.get("type") == "PLANNER_RESPONSE":
             tok = format_step_tokens(rec)
             if tok > 0:
                 latest_tokens = tok
         elif rec.get("type") == "CHECKPOINT":
             latest_checkpoint = rec
+            last_ckpt_idx = idx
 
     current_band = watermark_band(latest_tokens)
     state_path = artifact_dir / "scratch" / ".compaction_guard_state.json"
     state = load_state(state_path)
 
-    # Edge-triggered Case A: new CHECKPOINT compaction detected
-    if latest_checkpoint is not None:
+    # Edge-triggered Case A: new active CHECKPOINT compaction detected
+    if latest_checkpoint is not None and last_ckpt_idx is not None:
         ckpt_step = int(latest_checkpoint.get("step_index") if latest_checkpoint.get("step_index") is not None else -1)
         ckpt_key = make_checkpoint_key(latest_checkpoint)
         prev_step = int(state.get("last_handled_checkpoint_step", -1))
         prev_key = str(state.get("last_handled_checkpoint_key", ""))
-        if ckpt_step > prev_step or ckpt_key != prev_key:
-            state["last_handled_checkpoint_step"] = ckpt_step
-            state["last_handled_checkpoint_key"] = ckpt_key
-            # Align watermark band so the immediately following turn does not false-alarm
-            # on pre-compaction token counts; subsequent turns drop back to band 0.
-            state["last_warned_band"] = current_band
-            save_state(state_path, state)
 
+        if ckpt_step > prev_step or ckpt_key != prev_key:
+            # HIGH-1: Check if this is truly a newly triggered checkpoint or a stale checkpoint
+            # from long ago (e.g. hook enabled mid-session or state reset).
+            # Count PLANNER_RESPONSE occurrences after this checkpoint in tail_records.
+            post_ckpt_planners = [
+                r for r in tail_records[last_ckpt_idx + 1 :]
+                if r.get("type") == "PLANNER_RESPONSE" and not r.get("_superseded")
+            ]
+
+            if len(post_ckpt_planners) > 1:
+                # Historical checkpoint from many turns ago; silently update state without injecting
+                state["last_handled_checkpoint_step"] = ckpt_step
+                state["last_handled_checkpoint_key"] = ckpt_key
+                state["last_warned_band"] = current_band
+                save_state(state_path, state)
+                return {}, None
+
+            # Fresh compaction!
             full_path = transcript_path.parent / "transcript_full.jsonl"
+            is_lossy = False
             if not full_path.is_file():
                 full_path = transcript_path
-            return build_post_compaction_output(
+                is_lossy = True
+
+            output = build_post_compaction_output(
                 conversation_id=conversation_id,
                 artifact_dir=artifact_dir,
                 full_path=full_path,
                 ckpt_step=ckpt_step,
                 ckpt_key=ckpt_key,
+                is_lossy_source=is_lossy,
             )
+
+            # Prepare state update to persist after output is ready (HIGH-2)
+            state["last_handled_checkpoint_step"] = ckpt_step
+            state["last_handled_checkpoint_key"] = ckpt_key
+            state["last_warned_band"] = current_band
+            return output, (state_path, state)
 
     last_warned_band = int(state.get("last_warned_band", 0))
 
-    # Reset downward silently once post-compaction context drops below previous watermark
-    if current_band < last_warned_band:
+    # LOW-8: Only consider band resets if we actually saw valid token telemetry
+    if latest_tokens > 0 and current_band < last_warned_band:
         state["last_warned_band"] = current_band
         save_state(state_path, state)
-        return {}
+        return {}, None
 
     # Edge-triggered Case B: context crossed into a higher watermark band (>= 185k or >= 220k)
     if current_band > last_warned_band and latest_tokens >= WARNING_THRESHOLD_TOKENS:
-        state["last_warned_band"] = current_band
-        save_state(state_path, state)
-
+        # LOW-7: Check anchor grace window BEFORE advancing last_warned_band
         anchor_path = artifact_dir / "MEMORY_ANCHOR.md"
         if anchor_path.is_file():
             age_sec = time.time() - anchor_path.stat().st_mtime
-            if 0 <= age_sec <= ANCHOR_RECENT_GRACE_SEC:
-                return {}
+            grace_sec = ANCHOR_CRITICAL_GRACE_SEC if current_band >= 2 else ANCHOR_RECENT_GRACE_SEC
+            if 0 <= age_sec <= grace_sec:
+                # In grace period: don't alert and don't advance band so we can alert once grace expires
+                return {}, None
 
-        return build_watermark_output(
+        output = build_watermark_output(
             conversation_id=conversation_id,
             artifact_dir=artifact_dir,
             latest_tokens=latest_tokens,
             band=current_band,
         )
 
-    return {}
+        state["last_warned_band"] = current_band
+        return output, (state_path, state)
+
+    return {}, None
 
 
 def main() -> int:
@@ -422,8 +508,19 @@ def main() -> int:
         if not isinstance(payload, dict):
             sys.stdout.write("{}\n")
             return 0
-        result = run_guard(payload)
-        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+        result, pending_state = run_guard(payload)
+
+        # LOW-6: ensure_ascii=True produces clean pure-ASCII JSON (\uXXXX), 100% immune to Windows codepage issues
+        output_str = json.dumps(result, ensure_ascii=True)
+        sys.stdout.write(output_str + "\n")
+        sys.stdout.flush()
+
+        # HIGH-2: Only save state after successful output serialization & flush
+        if pending_state is not None:
+            state_p, state_obj = pending_state
+            save_state(state_p, state_obj)
+
         return 0
     except Exception:
         sys.stdout.write("{}\n")
