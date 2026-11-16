@@ -6,7 +6,7 @@ Reads the PreInvocation JSON payload from stdin, performs a fast tail scan of
   1. New CHECKPOINT compaction detected -> recovers MEMORY_ANCHOR.md, untruncated
      recent/pre-compaction USER_INPUT prompts from transcript_full.jsonl, and the
      pre-compaction PLANNER_RESPONSE snapshot, injecting them as a systemMessage.
-  2. Context token watermark crossed (185k / 220k) -> injects an urgent reminder
+  2. Context token watermark crossed (380k / 450k) -> injects an urgent reminder
      to persist constraints, exact paths/metrics, dead ends, and state into
      MEMORY_ANCHOR.md before compaction triggers.
 
@@ -101,7 +101,7 @@ def canonicalize_tail_records(records: List[Dict[str, Any]]) -> List[Dict[str, A
 
 
 def watermark_band(tokens: int) -> int:
-    """Return 0 (<185k), 1 (185k-219,999), or 2 (>=220k)."""
+    """Return 0 (<380k), 1 (380k-449,999), or 2 (>=450k)."""
     if tokens >= CRITICAL_THRESHOLD_TOKENS:
         return 2
     if tokens >= WARNING_THRESHOLD_TOKENS:
@@ -341,7 +341,7 @@ def build_watermark_output(
     latest_tokens: int,
     band: int,
 ) -> Dict[str, Any]:
-    """Construct injectSteps JSON when context crosses 185k / 220k warning bands."""
+    """Construct injectSteps JSON when context crosses 380k / 450k warning bands."""
     anchor_path = artifact_dir / "MEMORY_ANCHOR.md"
     guardian_posix = (SCRIPT_DIR / "context_guardian.py").as_posix()
     pct = (latest_tokens / COMPACTION_THRESHOLD_TOKENS) * 100.0
@@ -350,7 +350,7 @@ def build_watermark_output(
     sys_msg = "\n".join(
         [
             f"[CONTEXT WATERMARK {level}] 当前上下文已达 {latest_tokens:,} / {COMPACTION_THRESHOLD_TOKENS:,} tokens ({pct:.1f}%)。",
-            "Antigravity 即将或很快会在 ~250k tokens 触发有损 CHECKPOINT 压缩（仅保留泛化摘要，且历史用户输入将被截断至 ~1000 字节）。",
+            "Antigravity 即将或很快会在 ~512k tokens 触发有损 CHECKPOINT 压缩（仅保留泛化摘要，且历史用户输入将被截断至 ~1000 字节）。",
             f"请立即创建或更新 `{anchor_path}`，确保以下 5 项完整固化（如尚未初始化可先运行 `init-anchor`）：",
             "1. 铁律与负面约束（用户禁止事项、不可改动的文件/参数）",
             "2. 精确事实与参数账本（绝对路径、偏移量、命令、精确指标）",
@@ -362,7 +362,7 @@ def build_watermark_output(
     )
     user_md = (
         f"> ⚠️ **上下文高水位预警**：当前上下文已达 **{latest_tokens:,} tokens**"
-        f"（逼近 ~250k 有损压缩阈值），已提醒 Agent 将关键约束与进度无损固化至 `MEMORY_ANCHOR.md`。"
+        f"（逼近 ~512k 有损压缩阈值），已提醒 Agent 将关键约束与进度无损固化至 `MEMORY_ANCHOR.md`。"
     )
     return {
         "injectSteps": [
@@ -473,7 +473,7 @@ def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[P
         save_state(state_path, state)
         return {}, None
 
-    # Edge-triggered Case B: context crossed into a higher watermark band (>= 185k or >= 220k)
+    # Edge-triggered Case B: context crossed into a higher watermark band (>= 380k or >= 450k)
     if current_band > last_warned_band and latest_tokens >= WARNING_THRESHOLD_TOKENS:
         # LOW-7: Check anchor grace window BEFORE advancing last_warned_band
         anchor_path = artifact_dir / "MEMORY_ANCHOR.md"

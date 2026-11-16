@@ -261,10 +261,10 @@ class TestGuardianAndGuardFixes(unittest.TestCase):
             state = pig.load_state(art_dir / "scratch" / ".compaction_guard_state.json")
             self.assertEqual(state["last_handled_checkpoint_step"], 11)
 
-            # 2) LOW-7: Fresh anchor within 90s suppresses Band 1 (190k) WITHOUT advancing last_warned_band
+            # 2) LOW-7: Fresh anchor within 90s suppresses Band 1 (390k) WITHOUT advancing last_warned_band
             anchor_path = art_dir / "MEMORY_ANCHOR.md"
             anchor_path.write_text("# Anchor\n", encoding="utf-8")
-            stale_records.append({"step_index": 15, "type": "PLANNER_RESPONSE", "input_tokens": 190000})
+            stale_records.append({"step_index": 15, "type": "PLANNER_RESPONSE", "input_tokens": 390000})
             write_jsonl(t_path, stale_records)
 
             res_b1, pending_b1 = pig.run_guard(payload)
@@ -273,10 +273,10 @@ class TestGuardianAndGuardFixes(unittest.TestCase):
             state_after_b1 = pig.load_state(art_dir / "scratch" / ".compaction_guard_state.json")
             self.assertEqual(state_after_b1["last_warned_band"], 0)
 
-            # Age anchor to 45s (> 30s critical grace) and cross Band 2 (225k) -> MUST fire CRITICAL!
+            # Age anchor to 45s (> 30s critical grace) and cross Band 2 (460k) -> MUST fire CRITICAL!
             old_mtime = time.time() - 45
             os.utime(anchor_path, (old_mtime, old_mtime))
-            stale_records.append({"step_index": 16, "type": "PLANNER_RESPONSE", "input_tokens": 225000})
+            stale_records.append({"step_index": 16, "type": "PLANNER_RESPONSE", "input_tokens": 460000})
             write_jsonl(t_path, stale_records)
 
             proc = subprocess.run(

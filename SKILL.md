@@ -1,7 +1,7 @@
 ---
 name: anti-compaction-amnesia
 description: >-
-  防止 Antigravity 在上下文满（~250k tokens）触发有损压缩（CHECKPOINT / # Resuming from a compaction）后出现失忆、违背早期约束、重复已排除死胡同或丢失压缩前长输入。使用场景：长会话/多轮调试中需要防爆仓与持久化核心记忆、用户执行 /compact 前、收到 PreInvocation 高水位预警（≥185k tokens）、用户要求“记住/别忘了/防压缩失忆/保存进度”，或上下文中刚出现 `# Resuming from a compaction` 时立即触发。
+  防止 Antigravity 在上下文满（~512k tokens）触发有损压缩（CHECKPOINT / # Resuming from a compaction）后出现失忆、违背早期约束、重复已排除死胡同或丢失压缩前长输入。使用场景：长会话/多轮调试中需要防爆仓与持久化核心记忆、用户执行 /compact 前、收到 PreInvocation 高水位预警（≥380k tokens）、用户要求“记住/别忘了/防压缩失忆/保存进度”，或上下文中刚出现 `# Resuming from a compaction` 时立即触发。
 ---
 
 # Anti-Compaction Amnesia（防有损压缩失忆协议）
@@ -10,7 +10,7 @@ description: >-
 
 满足以下任一条件时**立即激活**本技能：
 1. **恢复触发（最高优先级）**：上下文中出现 `# Resuming from a compaction`（即 Antigravity 触发了 `CHECKPOINT` 有损压缩），或收到 `[ANTI-COMPACTION GUARD]` 自动注入提示。
-2. **预警触发**：收到 `[CONTEXT WATERMARK WARNING / CRITICAL]`（上下文达到 ≥185k / ≥220k tokens），或自感对话已很长、准备运行 `/compact`。
+2. **预警触发**：收到 `[CONTEXT WATERMARK WARNING / CRITICAL]`（上下文达到 ≥380k / ≥450k tokens），或自感对话已很长、准备运行 `/compact`。
 3. **主动触发**：用户要求“防止失忆”“保存当前记忆锚点”“总结别丢约束”“查一下前面贴过的完整内容”，或启动复杂长程任务（跨文件重构、多轮逆向、长文档批量修订、持续排错）需要防爆仓时。
 
 ---
@@ -19,7 +19,7 @@ description: >-
 
 通过审计本地会话日志（`transcript.jsonl` / `transcript_full.jsonl`），失忆源于 4 个明确机制：
 
-1. **250k 阈值 `<summary>` 泛化丢失精确度**：当活跃上下文（`input_tokens + cache_read_tokens`）逼近 ~250,000 tokens 时，系统插入 `CHECKPOINT` 步骤，把历史压成 7 段式摘要。摘要倾向概括成“修改了若干段落”“尝试过几个脚本”，导致**绝对路径、字节偏移、精确指标、具体报错栈、段落编号**失真。
+1. **512k 阈值 `<summary>` 泛化丢失精确度**：当活跃上下文（`input_tokens + cache_read_tokens`）逼近 ~512,000 tokens 时，系统插入 `CHECKPOINT` 步骤，把历史压成 7 段式摘要。摘要倾向概括成“修改了若干段落”“尝试过几个脚本”，导致**绝对路径、字节偏移、精确指标、具体报错栈、段落编号**失真。
 2. **`# User Requests` 约 1000 字节硬截断**：`CHECKPOINT` 里的历史用户请求每条在 ~1000 字节（实测 1,021–1,392 UTF-8 字节）处被强行截断（`<truncated N bytes>`）。用户若在压缩前贴了长日志、检测报告、需求文档或代码片段，压缩后模型完全看不到后半段，极易“刚发完就忘”。
 3. **多代重压缩劣化（雪球效应）**：超长会话会连续触发多次 `CHECKPOINT`（摘要再总结旧摘要），早期确立的**负面约束（不要改什么）**与**已排除死胡同（某条路走不通）**在第二、三次压缩后几乎彻底抹除，导致模型反复踩同一个坑。
 4. **磁盘无损全量日志闲置**：每次会话在 `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript_full.jsonl` 都会**100% 无损保留**所有完整用户输入、思考与工具调用；Artifact 目录（`<appDataDir>/brain/<conversation-id>/`）下的文件也会在每次 `CHECKPOINT` 底部自动列出路径——但若没有显式固化成锚点文件与专用检索工具，压缩后的模型不会主动去查。
@@ -46,7 +46,7 @@ description: >-
 
 ---
 
-### 防线二：逼近红线（≥185k Tokens）或 `/compact` 前的无损封存
+### 防线二：逼近红线（≥380k Tokens）或 `/compact` 前的无损封存
 
 当收到高水位预警，或准备运行 `/compact` 时，按以下步骤执行（**注意**：在多代理并发/Swarm 模式下，务必显式传入 `-c "<conversation-id>"` 防止串台）：
 
@@ -106,7 +106,7 @@ description: >-
 ## 自动护盾机制说明 (`pre_invocation_guard.py`)
 
 配套钩子脚本 [pre_invocation_guard.py](./scripts/pre_invocation_guard.py) 挂载于 `~/.gemini/config/hooks.json` 的 `PreInvocation` 阶段（边沿触发，日常只扫描末尾 ≤256 KB，零刷屏、异常静默放行 `{}`）：
-- **水位跨越提醒**：当活跃 token 首次跨越 **185,000 (74%)** 或 **220,000 (88%)** 时，自动注入系统提示要求立即刷新 `MEMORY_ANCHOR.md`（若 90 秒内已更新则跳过；CRITICAL 级别免打扰窗口缩减为 30 秒，避免漏报）。若会话日志无 token 遥测字段，CLI 会自动根据末次压缩以来的累积字节数估算活跃水位。
+- **水位跨越提醒**：当活跃 token 首次跨越 **380,000 (74%)** 或 **450,000 (88%)** 时，自动注入系统提示要求立即刷新 `MEMORY_ANCHOR.md`（若 90 秒内已更新则跳过；CRITICAL 级别免打扰窗口缩减为 30 秒，避免漏报）。若会话日志无 token 遥测字段，CLI 会自动根据末次压缩以来的累积字节数估算活跃水位。
 - **压缩后秒级恢复**：一旦检测到新触发的活跃 `CHECKPOINT`（自动忽略已被回退的旧检查点或陈旧历史），钩子会自动读取 `MEMORY_ANCHOR.md`，并在按需加载 `transcript_full.jsonl`（小文件全量读，大文件窗口读）后提取被截断的近期/压缩前用户输入与模型执行快照，通过 `systemMessage` 无损注入上下文。
 
 ---
@@ -119,6 +119,6 @@ description: >-
 
 ## 不要做的事
 
-- 不要在每次普通工具调用都重写 `MEMORY_ANCHOR.md`（仅在确立新约束、踩到新死胡同、完成里程碑、或水位 ≥185k 时更新）。
+- 不要在每次普通工具调用都重写 `MEMORY_ANCHOR.md`（仅在确立新约束、踩到新死胡同、完成里程碑、或水位 ≥380k 时更新）。
 - 不要把大段代码或整篇原始日志直接粘贴进 `MEMORY_ANCHOR.md`；用“简明事实 + `step_index` 书签”保持锚点精炼（建议 < 4 KB）。
 - 不要手动修改 `<artifactDir>/scratch/.compaction_guard_state.json` 状态文件来绕过边沿检测；如需关闭自动提示，使用 `context_guardian.py hook --disable`。

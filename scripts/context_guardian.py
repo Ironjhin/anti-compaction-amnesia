@@ -2,7 +2,7 @@
 """Antigravity anti-compaction amnesia guardian CLI.
 
 Inspects Antigravity conversation transcripts (`transcript.jsonl` and lossless
-`transcript_full.jsonl`), monitors token watermarks near the ~250k compaction
+`transcript_full.jsonl`), monitors token watermarks near the ~512k compaction
 threshold, initializes and displays `MEMORY_ANCHOR.md`, recovers truncated user
 inputs and pre-compaction model context, and manages the global `PreInvocation`
 guard hook in `~/.gemini/config/hooks.json`.
@@ -20,10 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-COMPACTION_THRESHOLD_TOKENS = 250_000
-WATCH_THRESHOLD_TOKENS = 150_000
-WARNING_THRESHOLD_TOKENS = 185_000
-CRITICAL_THRESHOLD_TOKENS = 220_000
+COMPACTION_THRESHOLD_TOKENS = 512_000
+WATCH_THRESHOLD_TOKENS = 307_000
+WARNING_THRESHOLD_TOKENS = 380_000
+CRITICAL_THRESHOLD_TOKENS = 450_000
 CHECKPOINT_USER_TRUNCATE_BYTES = 1000
 BYTES_PER_TOKEN_ESTIMATE = 3.5
 
@@ -247,12 +247,12 @@ def format_step_tokens(record: Dict[str, Any]) -> int:
 def watermark_band_label(tokens: int) -> str:
     """Map active context token count to a human-readable risk band."""
     if tokens >= CRITICAL_THRESHOLD_TOKENS:
-        return "CRITICAL (>= 220k: compaction imminent)"
+        return "CRITICAL (>= 450k: compaction imminent)"
     if tokens >= WARNING_THRESHOLD_TOKENS:
-        return "WARNING (185k-220k: update MEMORY_ANCHOR.md now)"
+        return "WARNING (380k-450k: update MEMORY_ANCHOR.md now)"
     if tokens >= WATCH_THRESHOLD_TOKENS:
-        return "WATCH (150k-185k: keep reads targeted)"
-    return "SAFE (< 150k)"
+        return "WATCH (307k-380k: keep reads targeted)"
+    return "SAFE (< 307k)"
 
 
 def unescape_nested_json(val: Any) -> Any:

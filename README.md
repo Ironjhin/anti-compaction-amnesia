@@ -6,12 +6,12 @@
 
 ---
 
-## 1. 项目背景：为什么 Antigravity 会在 ~250k Tokens 压缩后“失忆”？
+## 1. 项目背景：为什么 Antigravity 会在 ~512k Tokens 压缩后“失忆”？
 
 通过对 Antigravity 本地会话日志（`transcript.jsonl` 与全量无损 `transcript_full.jsonl`）的实测审计，长程任务（跨文件重构、多轮逆向分析、长文档批量修订、持续排错）中的“压缩后失忆”源于以下 4 个机制：
 
-1. **~250k Tokens 阈值触发 `<summary>` 泛化失真**
-   当活跃上下文（`input_tokens + cache_read_tokens`）逼近 `250,000 tokens` 时，系统自动插入 `CHECKPOINT` 步骤（`# Resuming from a compaction`），将此前对话压缩为结构化摘要。摘要会将会话细节概括化，导致**精确文件路径、字节偏移、命令参数、性能基线数值、具体报错栈**丢失。
+1. **~512k Tokens 阈值触发 `<summary>` 泛化失真**
+   当活跃上下文（`input_tokens + cache_read_tokens`）逼近 `512,000 tokens` 时，系统自动插入 `CHECKPOINT` 步骤（`# Resuming from a compaction`），将此前对话压缩为结构化摘要。摘要会将会话细节概括化，导致**精确文件路径、字节偏移、命令参数、性能基线数值、具体报错栈**丢失。
 2. **`# User Requests` 历史用户输入硬截断**
    `CHECKPOINT` 步骤附带的 `# User Requests` 列表会对较长的历史用户输入进行硬截断（附上 `<truncated N bytes>` 标记）。若用户在压缩前粘贴了长日志、检测报告、需求文档或代码片段，压缩后模型将无法看到被截断的后半部分内容。
 3. **多代重压缩劣化（雪球效应）**
@@ -26,7 +26,7 @@
 本项目通过 **Skill 规范约束 + `MEMORY_ANCHOR.md` 结构化记忆锚点 + `PreInvocation` 自动钩子 + 按需无损检索 CLI** 构建三道防线：
 
 - **防线一（日常增量锚定）**：在会话 Artifact 目录下维护 `MEMORY_ANCHOR.md`，固化 5 大核心区块（铁律与负面约束、精确事实与参数账本、已排除死胡同、里程碑与下一步动作、关键 `step_index` 书签）。
-- **防线二（185k / 220k 高水位预警封存）**：当上下文跨越 `185,000 tokens`（WARNING）或 `220,000 tokens`（CRITICAL）时，通过 `PreInvocation` 钩子自动注入预警提示，督促 Agent 在触发 ~250k 压缩前更新 `MEMORY_ANCHOR.md`。
+- **防线二（380k / 450k 高水位预警封存）**：当上下文跨越 `380,000 tokens`（WARNING）或 `450,000 tokens`（CRITICAL）时，通过 `PreInvocation` 钩子自动注入预警提示，督促 Agent 在触发 ~512k 压缩前更新 `MEMORY_ANCHOR.md`。
 - **防线三（`CHECKPOINT` 压缩后自动注入与按需回查）**：检测到新的 `CHECKPOINT` 后，`PreInvocation` 钩子自动提取 `MEMORY_ANCHOR.md`、近期/压缩前完整 `USER_INPUT` 以及压缩前最后一次 `PLANNER_RESPONSE` 快照，通过 `injectSteps` 的 `systemMessage` 无损注入模型上下文，并提供 CLI 工具按需检索 `transcript_full.jsonl`（严禁使用 `read_file` 裸读数 MB 的全量日志）。
 
 ### 目录结构
