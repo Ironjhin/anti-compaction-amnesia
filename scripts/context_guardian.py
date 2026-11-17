@@ -14,6 +14,8 @@ import argparse
 import json
 import os
 import re
+import shlex
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -40,7 +42,12 @@ _BOILERPLATE_TAG_RE = re.compile(
     r"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>.*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>",
     re.DOTALL,
 )
+_CKPT_TRUNCATED_ITEM_RE = re.compile(
+    r"^\d+\.\s+(.*?)\s*<truncated\s+\d+\s+bytes>",
+    re.MULTILINE | re.DOTALL,
+)
 _VALID_CID_RE = re.compile(r"^[0-9a-fA-F-]{4,64}$")
+_WIN_CMD_UNSAFE_CHARS = set(' \t"&^()%!<>|')
 
 
 def configure_utf8_stdio() -> None:
@@ -54,6 +61,32 @@ def configure_utf8_stdio() -> None:
                 pass
 
 
+def atomic_write_text(path: Path, content: str) -> None:
+    """Write UTF-8 text atomically using a PID-unique temp file and Windows-safe retry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    try:
+        tmp_path.write_text(content, encoding="utf-8", errors="replace")
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                os.replace(tmp_path, path)
+                last_err = None
+                break
+            except PermissionError as exc:
+                last_err = exc
+                if attempt < 2:
+                    time.sleep(0.02 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
 def extract_user_request(raw_content: Optional[str]) -> str:
     """Extract clean user prompt text from a USER_INPUT step's content."""
     if not raw_content:
@@ -63,6 +96,15 @@ def extract_user_request(raw_content: Optional[str]) -> str:
         return match.group(1).strip()
     cleaned = _BOILERPLATE_TAG_RE.sub("", raw_content)
     return cleaned.strip()
+
+
+def is_slash_compact_prompt(prompt: str) -> bool:
+    """Return True if a user prompt is a bare `/compact` command rather than task context."""
+    s = prompt.strip()
+    if not s:
+        return True
+    lower = s.lower()
+    return lower == "/compact" or (lower.startswith("/compact") and len(s) <= 24)
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -195,14 +237,17 @@ def get_transcript_paths(brain_dir: Path) -> Tuple[Path, Path]:
 def iter_jsonl_records(path: Path) -> Tuple[List[Tuple[int, Dict[str, Any]]], int]:
     """Parse all valid JSON objects from a JSONL file, keeping 1-based line numbers.
 
+    Iterates in binary mode on `b'\\n'` so embedded `\\r` (0x0D) or Unicode line
+    separators (U+0085 / U+2028 / U+2029) never split a JSON record mid-line.
+
     Returns:
         (records, skipped_lines_count)
     """
     records: List[Tuple[int, Dict[str, Any]]] = []
     skipped_count = 0
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
+    with path.open("rb") as fh:
         for line_no, raw_line in enumerate(fh, 1):
-            line = raw_line.strip()
+            line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
@@ -255,21 +300,27 @@ def watermark_band_label(tokens: int) -> str:
     return "SAFE (< 307k)"
 
 
-def unescape_nested_json(val: Any) -> Any:
+def unescape_nested_json(val: Any, _depth: int = 0) -> Any:
     """Recursively unpack JSON-serialized strings inside dict/list structures."""
+    if _depth >= 4:
+        return val
     if isinstance(val, str):
         s = val.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")) or (s.startswith('"') and s.endswith('"')):
+        if (
+            (s.startswith("{") and s.endswith("}"))
+            or (s.startswith("[") and s.endswith("]"))
+            or (s.startswith('"') and s.endswith('"'))
+        ):
             try:
                 parsed = json.loads(s)
-                return unescape_nested_json(parsed)
+                return unescape_nested_json(parsed, _depth + 1)
             except Exception:
                 return val
         return val
     if isinstance(val, dict):
-        return {k: unescape_nested_json(v) for k, v in val.items()}
+        return {k: unescape_nested_json(v, _depth + 1) for k, v in val.items()}
     if isinstance(val, list):
-        return [unescape_nested_json(item) for item in val]
+        return [unescape_nested_json(item, _depth + 1) for item in val]
     return val
 
 
@@ -284,30 +335,77 @@ def format_tool_calls(tool_calls: Any) -> str:
         return str(tool_calls)
 
 
+def flatten_searchable_text(val: Any) -> str:
+    """Flatten nested dicts/lists into raw unescaped text for accurate regex/literal search."""
+    unpacked = unescape_nested_json(val)
+    chunks: List[str] = []
+
+    def _walk(node: Any) -> None:
+        if node is None:
+            return
+        if isinstance(node, str):
+            chunks.append(node)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                chunks.append(str(k))
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+        else:
+            chunks.append(str(node))
+
+    _walk(unpacked)
+    return "\n".join(chunks)
+
+
+def estimate_record_bytes(rec: Dict[str, Any]) -> int:
+    """Calculate UTF-8 byte volume of content, thinking, tool_calls, and error in a record."""
+    total = 0
+    for field in ("content", "thinking", "tool_calls", "error"):
+        val = rec.get(field)
+        if val is not None:
+            if isinstance(val, (dict, list)):
+                total += len(json.dumps(val, ensure_ascii=False).encode("utf-8", errors="replace"))
+            else:
+                total += len(str(val).encode("utf-8", errors="replace"))
+    return total
+
+
 def estimate_active_tokens(
     records: List[Tuple[int, Dict[str, Any]]],
     last_ckpt_idx: Optional[int],
 ) -> Tuple[int, int]:
     """Estimate token usage when transcript lacks telemetry fields.
 
-    Calculates UTF-8 bytes of content, thinking, tool_calls, and error
-    accumulated since the latest active CHECKPOINT (or start).
+    Includes the active CHECKPOINT summary itself (when present) and skips
+    superseded/rewound records.
     Returns: (estimated_tokens, total_bytes)
     """
-    start_pos = (last_ckpt_idx + 1) if last_ckpt_idx is not None else 0
+    start_pos = last_ckpt_idx if last_ckpt_idx is not None else 0
     total_bytes = 0
     for i in range(start_pos, len(records)):
         _ln, rec = records[i]
-        for field in ("content", "thinking", "tool_calls", "error"):
-            val = rec.get(field)
-            if val is not None:
-                if isinstance(val, (dict, list)):
-                    total_bytes += len(json.dumps(val, ensure_ascii=False).encode("utf-8", errors="replace"))
-                else:
-                    total_bytes += len(str(val).encode("utf-8", errors="replace"))
+        if rec.get("_superseded"):
+            continue
+        total_bytes += estimate_record_bytes(rec)
 
     est_tokens = int(total_bytes / BYTES_PER_TOKEN_ESTIMATE)
     return est_tokens, total_bytes
+
+
+def extract_checkpoint_truncated_prefixes(records: List[Tuple[int, Dict[str, Any]]]) -> List[str]:
+    """Extract prompt prefixes explicitly marked with `<truncated N bytes>` in active CHECKPOINTs."""
+    prefixes: List[str] = []
+    for _ln, rec in records:
+        if rec.get("type") != "CHECKPOINT" or rec.get("_superseded"):
+            continue
+        content = str(rec.get("content") or "")
+        for match in _CKPT_TRUNCATED_ITEM_RE.finditer(content):
+            snippet = " ".join(match.group(1).split())
+            if len(snippet) >= 32:
+                prefixes.append(snippet[:120])
+    return prefixes
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -331,7 +429,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     all_checkpoints: List[Tuple[int, int, str, bool, int]] = []  # (line_no, step_idx, created_at, superseded, rec_idx)
     last_active_ckpt_idx: Optional[int] = None
     last_active_ckpt_step: Optional[int] = None
-    last_active_ckpt_ts: str = ""
 
     last_active_planner_idx: Optional[int] = None
     pre_ckpt_tokens = 0
@@ -364,7 +461,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             if not is_superseded:
                 last_active_ckpt_idx = idx
                 last_active_ckpt_step = int(step_idx if step_idx is not None else -1)
-                last_active_ckpt_ts = str(rec.get("created_at") or "")
                 pre_ckpt_tokens = latest_tokens
 
     active_ckpts = [c for c in all_checkpoints if not c[3]]
@@ -387,7 +483,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     skip_str = f" [skipped {skipped_count} malformed/blank lines]" if skipped_count > 0 else ""
     print(f"Total Steps          : {len(records)} records (max step_index={max_step_index}){skip_str}")
 
-    # Determine context watermark status (H1, M2)
+    # Determine context watermark status (H1, M2, LOW-11)
     if not saw_token_fields:
         est_tokens, est_bytes = estimate_active_tokens(records, last_active_ckpt_idx)
         ref_label = f"last CHECKPOINT (step {last_active_ckpt_step})" if last_active_ckpt_step is not None else "conversation start"
@@ -408,10 +504,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         print(f"Peak Context Tokens  : {peak_tokens:,} tokens [step {peak_token_step}]")
     else:
-        pct = (latest_tokens / COMPACTION_THRESHOLD_TOKENS) * 100.0 if latest_tokens else 0.0
+        pending_bytes = 0
+        if last_active_planner_idx is not None:
+            for i in range(last_active_planner_idx + 1, len(records)):
+                if not records[i][1].get("_superseded"):
+                    pending_bytes += estimate_record_bytes(records[i][1])
+        pending_tokens = int(pending_bytes / BYTES_PER_TOKEN_ESTIMATE)
+        effective_tokens = latest_tokens + pending_tokens
+        pct = (effective_tokens / COMPACTION_THRESHOLD_TOKENS) * 100.0 if effective_tokens else 0.0
+        pending_note = f" (+~{pending_tokens:,} pending tokens)" if pending_tokens >= 1000 else ""
         print(
-            f"Current Context      : {latest_tokens:,} / {COMPACTION_THRESHOLD_TOKENS:,} tokens "
-            f"({pct:.1f}%) [step {latest_token_step}] -> {watermark_band_label(latest_tokens)}"
+            f"Current Context      : {latest_tokens:,}{pending_note} / {COMPACTION_THRESHOLD_TOKENS:,} tokens "
+            f"({pct:.1f}%) [step {latest_token_step}] -> {watermark_band_label(effective_tokens)}"
         )
         print(f"Peak Context Tokens  : {peak_tokens:,} tokens [step {peak_token_step}]")
 
@@ -444,12 +548,14 @@ def collect_user_inputs(
     """Collect chronological USER_INPUT entries with extracted prompts and byte lengths.
 
     Accurately classifies inputs:
-    - 'truncated': Occurred before active CHECKPOINT and bytes > CHECKPOINT_USER_TRUNCATE_BYTES.
+    - 'truncated': Occurred before active CHECKPOINT and either matched an explicit
+      `<truncated N bytes>` marker in CHECKPOINT or exceeded CHECKPOINT_USER_TRUNCATE_BYTES.
     - 'at_risk': Occurred after active CHECKPOINT (or no CHECKPOINT) and bytes > CHECKPOINT_USER_TRUNCATE_BYTES.
     - 'normal': Safe size (<= CHECKPOINT_USER_TRUNCATE_BYTES).
     """
     items: List[Dict[str, Any]] = []
     seen_steps: Dict[int, int] = {}
+    ckpt_trunc_prefixes = extract_checkpoint_truncated_prefixes(records)
 
     for line_no, rec in records:
         if rec.get("type") != "USER_INPUT":
@@ -460,9 +566,12 @@ def collect_user_inputs(
 
         prompt = extract_user_request(rec.get("content"))
         utf8_bytes = len(prompt.encode("utf-8", errors="replace"))
+        norm_prompt = " ".join(prompt.split())
 
         is_before_ckpt = (latest_active_ckpt_line is not None) and (line_no < latest_active_ckpt_line)
-        if utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES:
+        matched_ckpt_marker = is_before_ckpt and any(norm_prompt.startswith(pref) for pref in ckpt_trunc_prefixes)
+
+        if matched_ckpt_marker or utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES:
             if is_before_ckpt:
                 status = "truncated"
             else:
@@ -555,7 +664,6 @@ def cmd_recover(args: argparse.Namespace) -> int:
         print("- (No USER_INPUT records found)")
     else:
         index_limit = getattr(args, "index_limit", 30)
-        # Prioritize truncated / at-risk inputs plus latest N inputs
         displayed_inputs = user_inputs
         omitted_count = 0
         if index_limit > 0 and len(user_inputs) > index_limit:
@@ -589,23 +697,31 @@ def cmd_recover(args: argparse.Namespace) -> int:
             print(f"- ... [Omitted {omitted_count} earlier short inputs; pass --index-limit 0 to view all]")
     print()
 
-    # Section 3: Full Untruncated User Inputs
+    # Section 3: Full Untruncated User Inputs (recent substantive + pre-ckpt + recent truncated >1KB)
     selected_map: Dict[int, Dict[str, Any]] = {}
     active_inputs = [item for item in user_inputs if not item.get("superseded")]
-    if args.last_inputs > 0 and active_inputs:
-        for item in active_inputs[-args.last_inputs :]:
+    substantive_inputs = [item for item in active_inputs if not is_slash_compact_prompt(item["prompt"])]
+    pool = substantive_inputs if substantive_inputs else active_inputs
+
+    if args.last_inputs > 0 and pool:
+        for item in pool[-args.last_inputs :]:
             selected_map[item["line_no"]] = item
 
     if active_checkpoints:
         last_ckpt_line = active_checkpoints[-1][1]
-        pre_ckpt_inputs = [item for item in active_inputs if item["line_no"] < last_ckpt_line]
+        pre_ckpt_inputs = [item for item in pool if item["line_no"] < last_ckpt_line]
         if pre_ckpt_inputs:
             pre_item = pre_ckpt_inputs[-1]
             selected_map[pre_item["line_no"]] = pre_item
+        # Always recover up to 2 most recent truncated (>1KB) pre-checkpoint inputs!
+        truncated_pre = [item for item in active_inputs if item["status"] == "truncated"]
+        for t_item in truncated_pre[-2:]:
+            selected_map[t_item["line_no"]] = t_item
 
     selected_inputs = [selected_map[k] for k in sorted(selected_map.keys())]
+    input_char_cap = 0 if args.max_chars <= 0 else args.max_chars
 
-    print(f"## 3. Full Untruncated User Inputs (last {args.last_inputs} + pre-compaction input)")
+    print(f"## 3. Full Untruncated User Inputs (last {args.last_inputs} + truncated/pre-compaction inputs)")
     if not selected_inputs:
         print("(none)")
     else:
@@ -619,55 +735,65 @@ def cmd_recover(args: argparse.Namespace) -> int:
                 f"--- [USER_INPUT line={item['line_no']} step={item['step_index']} "
                 f"at {item['created_at']} | {item['bytes']} bytes{flag}] ---"
             )
-            print(truncate_text(item["prompt"], args.max_chars))
+            print(truncate_text(item["prompt"], input_char_cap))
             print()
 
-    # Section 4: Pre-Compaction & Post-Compaction Model Context (L8)
+    # Section 4: Pre-Compaction & Post-Compaction Model Context (L8, skip superseded, bounded cap)
+    snap_cap = 0 if args.max_chars <= 0 else min(args.max_chars, 1200)
     print("## 4. Pre-Compaction & Post-Compaction Model Context")
     if active_checkpoints:
         last_pos, last_line, last_ckpt = active_checkpoints[-1]
-        pre_window = records[max(0, last_pos - 6) : last_pos]
+        pre_candidates = [
+            (ln, r)
+            for ln, r in records[:last_pos]
+            if not r.get("_superseded") and r.get("type") in ("PLANNER_RESPONSE", "GENERIC")
+        ]
+        pre_window = pre_candidates[-4:]
         print(f"### Before Latest Active CHECKPOINT (line {last_line}, step {last_ckpt.get('step_index')})")
         for line_no, rec in pre_window:
             rtype = rec.get("type")
-            if rtype not in ("PLANNER_RESPONSE", "GENERIC"):
-                continue
             print(f"[line={line_no} step={rec.get('step_index')} type={rtype}]")
-            char_cap = args.max_chars if args.max_chars > 0 else 800
             if rec.get("thinking"):
-                print("Thinking:", truncate_text(str(rec["thinking"]), char_cap))
+                print("Thinking:", truncate_text(str(rec["thinking"]), snap_cap))
             if rec.get("tool_calls"):
-                print("ToolCalls:", truncate_text(format_tool_calls(rec["tool_calls"]), char_cap))
+                print("ToolCalls:", truncate_text(format_tool_calls(rec["tool_calls"]), snap_cap))
             if rec.get("content"):
-                print("Content:", truncate_text(str(rec["content"]), char_cap))
+                print("Content:", truncate_text(str(rec["content"]), snap_cap))
             print()
 
-        post_window = records[last_pos + 1 : last_pos + 5]
+        post_candidates = [
+            (ln, r)
+            for ln, r in records[last_pos + 1 :]
+            if not r.get("_superseded")
+        ]
+        post_window = post_candidates[:4]
         if post_window:
             print("### Immediately After Latest Active CHECKPOINT")
             for line_no, rec in post_window:
                 print(f"[line={line_no} step={rec.get('step_index')} type={rec.get('type')}]")
-                char_cap = args.max_chars if args.max_chars > 0 else 800
                 if rec.get("thinking"):
-                    print("Thinking:", truncate_text(str(rec["thinking"]), char_cap))
+                    print("Thinking:", truncate_text(str(rec["thinking"]), snap_cap))
                 if rec.get("tool_calls"):
-                    print("ToolCalls:", truncate_text(format_tool_calls(rec["tool_calls"]), char_cap))
+                    print("ToolCalls:", truncate_text(format_tool_calls(rec["tool_calls"]), snap_cap))
                 if rec.get("content"):
-                    print("Content:", truncate_text(str(rec["content"]), char_cap))
+                    print("Content:", truncate_text(str(rec["content"]), snap_cap))
                 print()
     else:
-        recent_model = [(ln, r) for ln, r in records[-8:] if r.get("type") in ("PLANNER_RESPONSE", "GENERIC")]
+        recent_model = [
+            (ln, r)
+            for ln, r in records
+            if not r.get("_superseded") and r.get("type") in ("PLANNER_RESPONSE", "GENERIC")
+        ]
         if not recent_model:
             print("(No recent model steps)")
         for line_no, rec in recent_model[-4:]:
             print(f"[line={line_no} step={rec.get('step_index')} type={rec.get('type')}]")
-            char_cap = args.max_chars if args.max_chars > 0 else 800
             if rec.get("thinking"):
-                print("Thinking:", truncate_text(str(rec["thinking"]), char_cap))
+                print("Thinking:", truncate_text(str(rec["thinking"]), snap_cap))
             if rec.get("tool_calls"):
-                print("ToolCalls:", truncate_text(format_tool_calls(rec["tool_calls"]), char_cap))
+                print("ToolCalls:", truncate_text(format_tool_calls(rec["tool_calls"]), snap_cap))
             if rec.get("content"):
-                print("Content:", truncate_text(str(rec["content"]), char_cap))
+                print("Content:", truncate_text(str(rec["content"]), snap_cap))
             print()
 
     print("## 5. MEMORY_ANCHOR.md Content")
@@ -677,7 +803,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     else:
         print(
             f"[WARNING] MEMORY_ANCHOR.md does not exist at {anchor_path}.\n"
-            f"Run: python \"{Path(__file__).resolve()}\" init-anchor --conversation-id {cid}"
+            f'Run: python "{Path(__file__).resolve()}" init-anchor --conversation-id {cid}'
         )
     return 0
 
@@ -693,14 +819,11 @@ def extract_search_fields(rec: Dict[str, Any]) -> List[Tuple[str, str]]:
     if rec.get("thinking"):
         fields.append(("thinking", str(rec["thinking"])))
     if rec.get("tool_calls"):
-        fields.append(("tool_calls", format_tool_calls(rec["tool_calls"]).replace("\\\\", "\\")))
+        # Flatten raw unescaped strings so Windows backslashes, quotes, and multi-line args match naturally
+        fields.append(("tool_calls", flatten_searchable_text(rec["tool_calls"])))
     if rec.get("error"):  # L4: include error field
         err_val = rec["error"]
-        err_text = (
-            json.dumps(err_val, ensure_ascii=False).replace("\\\\", "\\")
-            if isinstance(err_val, (dict, list))
-            else str(err_val)
-        )
+        err_text = flatten_searchable_text(err_val) if isinstance(err_val, (dict, list)) else str(err_val)
         fields.append(("error", err_text))
     return fields
 
@@ -721,12 +844,10 @@ def cmd_search(args: argparse.Namespace) -> int:
     cid, brain_dir = resolve_brain_dir(args.conversation_id, brain_root=brain_root)
     compact_path, full_path = get_transcript_paths(brain_dir)
 
-    is_lossy = False
     if full_path.is_file():
         source_path = full_path
     elif compact_path.is_file():
         source_path = compact_path
-        is_lossy = True
         print(
             "[WARNING] transcript_full.jsonl not found; falling back to lossy transcript.jsonl "
             "(some fields may be truncated).",
@@ -745,6 +866,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             regex = re.compile(re.escape(args.pattern), re.IGNORECASE)
 
     records, _ = iter_jsonl_records(source_path)
+    canonicalize_records(records)
     hits = 0
     search_desc = f"literal '{args.pattern}'" if literal_mode else f"/{args.pattern}/i"
     print(f"Searching {source_path.name} for {search_desc} in conversation {cid}...")
@@ -945,7 +1067,6 @@ def cmd_init_anchor(args: argparse.Namespace) -> int:
 
         selected_indices = sorted(prio_indices)
         if len(selected_indices) > 25:
-            # Keep all truncated/at-risk, and fill remainder with latest
             at_risk = [i for i in selected_indices if all_inputs[i]["status"] in ("truncated", "at_risk")]
             normal = [i for i in selected_indices if all_inputs[i]["status"] == "normal"]
             needed = max(0, 25 - len(at_risk))
@@ -990,14 +1111,68 @@ def cmd_init_anchor(args: argparse.Namespace) -> int:
             ]
         )
 
-    # Atomic write (L6, L11)
     final_text = "\n".join(content_parts) + "\n"
-    tmp_path = brain_dir / "MEMORY_ANCHOR.md.tmp"
-    tmp_path.write_text(final_text, encoding="utf-8", errors="replace")
-    os.replace(tmp_path, anchor_path)
+    atomic_write_text(anchor_path, final_text)
 
     print(f"Created MEMORY_ANCHOR.md at: {anchor_path}")
     return 0
+
+
+def _windows_short_path(path: Path) -> Optional[str]:
+    """Resolve Windows 8.3 short path (contains no spaces) via GetShortPathNameW."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        resolved = str(path.resolve())
+        buf = ctypes.create_unicode_buffer(1024)
+        res = ctypes.windll.kernel32.GetShortPathNameW(resolved, buf, 1024)
+        if 0 < res < 1024 and buf.value:
+            return Path(buf.value).as_posix()
+    except Exception:
+        pass
+    return None
+
+
+def make_windows_cmd_safe_path(
+    target: Path,
+    cwd_base: Optional[Path] = None,
+    is_python_exe: bool = False,
+) -> str:
+    """Format a path safely for Antigravity's `exec.Command('cmd', '/c', command)` on Windows.
+
+    IMPORTANT: On Windows, Go's `syscall.EscapeArg` (used by `exec.Command('cmd', '/c', cmd)`)
+    escapes any embedded `"` into `\\"`, which `cmd.exe` rejects with exit code 1.
+    Therefore Windows hook commands MUST NOT contain embedded double quotes.
+    """
+    resolved = target.resolve()
+    if cwd_base is not None:
+        try:
+            rel_posix = resolved.relative_to(cwd_base.resolve()).as_posix()
+            if rel_posix and not any(c in rel_posix for c in _WIN_CMD_UNSAFE_CHARS):
+                return rel_posix
+        except ValueError:
+            pass
+
+    posix = resolved.as_posix()
+    if not any(c in posix for c in _WIN_CMD_UNSAFE_CHARS):
+        return posix
+
+    short_posix = _windows_short_path(resolved)
+    if short_posix and not any(c in short_posix for c in _WIN_CMD_UNSAFE_CHARS):
+        return short_posix
+
+    if is_python_exe:
+        which_py = shutil.which("python")
+        if which_py:
+            try:
+                if Path(which_py).resolve() == resolved:
+                    return "python"
+            except Exception:
+                pass
+
+    return posix
 
 
 def load_hooks_json(path: Path) -> Dict[str, Any]:
@@ -1013,14 +1188,32 @@ def load_hooks_json(path: Path) -> Dict[str, Any]:
     return data
 
 
-def build_hook_spec(existing_entry: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def build_hook_spec(
+    existing_entry: Optional[Dict[str, Any]] = None,
+    hooks_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Return the PreInvocation hook entry for `anti-compaction-amnesia`.
 
-    Uses absolute path of current Python interpreter with -X utf8 for Windows cmd /c safety (M7, MED-5).
+    On Windows (`cmd /c`), avoids embedded double quotes that Go `EscapeArg` turns into
+    `\\"` (breaking `cmd.exe`), using relative script path from `hooks_dir` when under
+    the customization root and 8.3 short paths when `sys.executable` has spaces.
+    On Unix (`sh -c`), uses `shlex.quote`.
     """
-    py_exe = Path(sys.executable).resolve().as_posix()
-    script_posix = GUARD_SCRIPT_PATH.resolve().as_posix()
-    command = f'"{py_exe}" -X utf8 "{script_posix}"'
+    base_dir = hooks_dir if hooks_dir is not None else DEFAULT_HOOKS_PATH.parent
+    py_path = Path(sys.executable).resolve()
+    script_path = GUARD_SCRIPT_PATH.resolve()
+
+    if os.name == "nt":
+        py_cmd = make_windows_cmd_safe_path(py_path, is_python_exe=True)
+        script_cmd = make_windows_cmd_safe_path(script_path, cwd_base=base_dir)
+        command = f"{py_cmd} -X utf8 {script_cmd}"
+    else:
+        try:
+            rel = script_path.relative_to(base_dir.resolve()).as_posix()
+            script_str = rel
+        except ValueError:
+            script_str = script_path.as_posix()
+        command = f"{shlex.quote(py_path.as_posix())} -X utf8 {shlex.quote(script_str)}"
 
     spec: Dict[str, Any] = {
         "enabled": True,
@@ -1033,7 +1226,6 @@ def build_hook_spec(existing_entry: Optional[Dict[str, Any]] = None) -> Dict[str
         ],
     }
     if isinstance(existing_entry, dict):
-        # Preserve user's custom timeout or other fields if already configured
         for key, val in existing_entry.items():
             if key not in ("enabled", "PreInvocation"):
                 spec[key] = val
@@ -1059,6 +1251,16 @@ def cmd_hook(args: argparse.Namespace) -> int:
             enabled = entry.get("enabled", True)
             print(f"Hook '{HOOK_KEY}': {'ENABLED' if enabled else 'DISABLED'} in {hooks_path}")
             print(json.dumps(entry, ensure_ascii=False, indent=2))
+            if os.name == "nt":
+                pre_list = entry.get("PreInvocation")
+                if isinstance(pre_list, list) and pre_list and isinstance(pre_list[0], dict):
+                    cmd_str = str(pre_list[0].get("command") or "")
+                    if '"' in cmd_str:
+                        print(
+                            "[WARNING] Hook command contains embedded double quotes, which fail under "
+                            "Windows `cmd /c` in Antigravity! Run `hook --enable` to repair.",
+                            file=sys.stderr,
+                        )
         return 0
 
     if args.enable:
@@ -1067,9 +1269,8 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
         hooks_path.parent.mkdir(parents=True, exist_ok=True)
         existing_entry = hooks_data.get(HOOK_KEY) if isinstance(hooks_data.get(HOOK_KEY), dict) else None
-        hooks_data[HOOK_KEY] = build_hook_spec(existing_entry)
+        hooks_data[HOOK_KEY] = build_hook_spec(existing_entry, hooks_dir=hooks_path.parent)
 
-        # Atomic backup and write (M6)
         if hooks_path.is_file():
             bak_path = hooks_path.with_suffix(".json.bak")
             try:
@@ -1077,13 +1278,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
             except Exception:
                 pass
 
-        tmp_path = hooks_path.with_suffix(".json.tmp")
-        tmp_path.write_text(
-            json.dumps(hooks_data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            errors="replace",
-        )
-        os.replace(tmp_path, hooks_path)
+        atomic_write_text(hooks_path, json.dumps(hooks_data, ensure_ascii=False, indent=2) + "\n")
         print(f"Enabled PreInvocation hook '{HOOK_KEY}' in {hooks_path}")
         return 0
 
@@ -1103,13 +1298,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
             except Exception:
                 pass
 
-        tmp_path = hooks_path.with_suffix(".json.tmp")
-        tmp_path.write_text(
-            json.dumps(hooks_data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            errors="replace",
-        )
-        os.replace(tmp_path, hooks_path)
+        atomic_write_text(hooks_path, json.dumps(hooks_data, ensure_ascii=False, indent=2) + "\n")
         print(f"Disabled PreInvocation hook '{HOOK_KEY}' in {hooks_path}")
         return 0
 
@@ -1127,21 +1316,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show context token usage, compaction checkpoints, and anchor status.")
     p_status.add_argument("--conversation-id", "-c", default="auto", help="Conversation UUID (default: auto/latest).")
-    p_status.add_argument("--brain-root", default=None, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
+    p_status.add_argument("--brain-root", default=argparse.SUPPRESS, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
     p_status.set_defaults(func=cmd_status)
 
     p_recover = sub.add_parser("recover", help="Recover untruncated user inputs and pre-compaction context.")
     p_recover.add_argument("--conversation-id", "-c", default="auto", help="Conversation UUID (default: auto/latest).")
-    p_recover.add_argument("--brain-root", default=None, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
+    p_recover.add_argument("--brain-root", default=argparse.SUPPRESS, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
     p_recover.add_argument("--last-inputs", type=int, default=3, help="Number of recent USER_INPUT steps to show in full.")
     p_recover.add_argument("--index-limit", type=int, default=30, help="Max inputs to list in section 2 (0 for all).")
-    p_recover.add_argument("--max-chars", type=int, default=8000, help="Max chars per recovered input (0 for unlimited).")
+    p_recover.add_argument("--max-chars", type=int, default=8000, help="Max chars per recovered input (0 or -1 for unlimited).")
     p_recover.set_defaults(func=cmd_recover)
 
     p_search = sub.add_parser("search", help="Search lossless transcript_full.jsonl by regex/keyword. Use -- for patterns starting with '-'.")
     p_search.add_argument("pattern", help="Regex or literal keyword to search (case-insensitive). For patterns starting with '-', use: search -- '-pattern'")
     p_search.add_argument("--conversation-id", "-c", default="auto", help="Conversation UUID (default: auto/latest).")
-    p_search.add_argument("--brain-root", default=None, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
+    p_search.add_argument("--brain-root", default=argparse.SUPPRESS, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
     p_search.add_argument("--source", choices=["USER_EXPLICIT", "MODEL", "SYSTEM"], help="Filter by step source.")
     p_search.add_argument(
         "--type",
@@ -1157,14 +1346,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_step.add_argument("step_index", type=int, help="Starting step_index.")
     p_step.add_argument("end_step", type=int, nargs="?", default=None, help="Optional inclusive ending step_index.")
     p_step.add_argument("--conversation-id", "-c", default="auto", help="Conversation UUID (default: auto/latest).")
-    p_step.add_argument("--brain-root", default=None, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
+    p_step.add_argument("--brain-root", default=argparse.SUPPRESS, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
     p_step.add_argument("--max-chars", type=int, default=0, help="Max chars per field (0 for default cap / -1 for unlimited).")
     p_step.add_argument("--all-occurrences", action="store_true", help="Include earlier retried/superseded occurrences of step_index.")
     p_step.set_defaults(func=cmd_step)
 
     p_init = sub.add_parser("init-anchor", help="Initialize MEMORY_ANCHOR.md in the conversation artifact directory.")
     p_init.add_argument("--conversation-id", "-c", default="auto", help="Conversation UUID (default: auto/latest).")
-    p_init.add_argument("--brain-root", default=None, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
+    p_init.add_argument("--brain-root", default=argparse.SUPPRESS, help="Custom brain root directory (or set $AGY_BRAIN_ROOT).")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing MEMORY_ANCHOR.md (saves .bak first).")
     p_init.set_defaults(func=cmd_init_anchor)
 

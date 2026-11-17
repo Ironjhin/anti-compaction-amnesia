@@ -150,4 +150,11 @@ python "$HOME/.gemini/config/skills/anti-compaction-amnesia/scripts/context_guar
   - ✅ **LOW-10 & LOW-11** (`pre_invocation_guard.py` & `SKILL.md`)：状态文件改为 `.tmp` + `os.replace` 原子写入，并在文档补充滞后说明。
   - ✅ **INFO-12 & `SKILL.md`** (`SKILL.md` & `README.md`)：`SKILL.md` 已同步真实截断阈值、尾部扫描与按需读全量规则以及真实状态文件路径。
 
-👉 **完整审查细节、逐条解决状态与第 5 节修复总结请参阅 [`REVIEW_ISSUES.md`](./REVIEW_ISSUES.md)。**
+### 4.3 二轮实测复查与并发热重载加固（512k & 多代理环境）
+
+- ✅ **Windows `cmd /c` 零内嵌双引号加固**：针对 Go `exec.Command("cmd", "/c", cmd)` 将内嵌 `"` 转义为 `\"` 导致 `cmd.exe` 退出码 `1` 的问题，自动采用相对脚本路径与 Windows 8.3 短路径，彻底消除内嵌引号并经真实 `cmd /c` 集成测试验证。
+- ✅ **纯正 `injectSteps` 契约与进程级原子写入**：严格输出标准 `{"injectSteps": [{"systemMessage": {"systemMessage": "..."}}]}` 纯 ASCII JSON；所有状态与配置写入采用 PID 隔离临时文件 + Windows 文件锁重试替换，支持运行中零中断热重载。
+- ✅ **Swarm Worker 与只读子代理无感兼容**：后台自治 Swarm Worker（无 `USER_INPUT`）自动跳过水位命令提醒以保护 `post_message` + `swarm_wait` 循环，压缩后则自动恢复任务简报 `SYSTEM_MESSAGE`；交互式会话提示兼容只读子代理与 Plan Mode。
+- ✅ **穿透 `/compact` 精准找回 `>1KB` 截断输入 + 工具大输出增量感知**：自动跳过裸 `/compact` 并回溯提取压缩前被截断的超长用户输入；实时叠加末次模型响应后的新增工具输出字节数，消除一步滞后盲区。
+
+👉 **完整审查细节、逐条解决状态与第 5–6 节修复总结请参阅 [`REVIEW_ISSUES.md`](./REVIEW_ISSUES.md)。**

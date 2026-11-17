@@ -94,11 +94,11 @@ description: >-
 
 | 子命令 | 用途 | 常用命令示例 |
 |---|---|---|
-| `status` | 查看当前 token 占用、水位等级（SAFE/WATCH/WARNING/CRITICAL）、历史压缩次数、`MEMORY_ANCHOR.md` 状态 | `python ".../context_guardian.py" status` |
-| `init-anchor` | 在当前会话 Artifact 目录生成 `MEMORY_ANCHOR.md` 并自动附带历史 `USER_INPUT` 索引表 | `python ".../context_guardian.py" init-anchor` |
-| `recover` | 从 `transcript_full.jsonl` 无损恢复所有用户输入索引（标出 `[TRUNCATED BY CHECKPOINT]`）、压缩前完整用户输入及最后模型快照 | `python ".../context_guardian.py" recover --last-inputs 3 --max-chars 8000` |
-| `search` | 按正则/关键词检索 `transcript_full.jsonl`（支持 `--source`、`--type` 过滤） | `python ".../context_guardian.py" search "报错关键词" --type GENERIC --max-results 10` |
-| `step` | 精准读取单个或一段 `step_index` 的完整 `content` / `thinking` / `tool_calls` | `python ".../context_guardian.py" step 440 443` |
+| `status` | 查看当前 token 占用（含待结算工具输出增量）、水位等级、历史压缩次数、`MEMORY_ANCHOR.md` 状态 | `python ".../context_guardian.py" status -c "<conversation-id>"` |
+| `init-anchor` | 在当前会话 Artifact 目录生成 `MEMORY_ANCHOR.md` 并自动附带高风险/近期 `USER_INPUT` 索引表 | `python ".../context_guardian.py" init-anchor -c "<conversation-id>"` |
+| `recover` | 从 `transcript_full.jsonl` 无损恢复用户输入索引、被截断（>1KB）及近期完整输入与模型快照 | `python ".../context_guardian.py" recover -c "<conversation-id>" --last-inputs 3 --max-chars 8000` |
+| `search` | 按正则或字面量（`-F`）检索 `transcript_full.jsonl`（搜索 `-` 开头词请加 `--`） | `python ".../context_guardian.py" search "报错关键词" -c "<conversation-id>" --max-results 10` |
+| `step` | 精准读取单个或一段 `step_index` 的完整 `content` / `thinking` / `tool_calls` / `error` | `python ".../context_guardian.py" step 440 443 -c "<conversation-id>"` |
 | `hook` | 检查、开启或关闭 `~/.gemini/config/hooks.json` 中的全局 `PreInvocation` 防失忆护盾 | `python ".../context_guardian.py" hook --status` / `--enable` / `--disable` |
 
 ---
@@ -106,8 +106,8 @@ description: >-
 ## 自动护盾机制说明 (`pre_invocation_guard.py`)
 
 配套钩子脚本 [pre_invocation_guard.py](./scripts/pre_invocation_guard.py) 挂载于 `~/.gemini/config/hooks.json` 的 `PreInvocation` 阶段（边沿触发，日常只扫描末尾 ≤256 KB，零刷屏、异常静默放行 `{}`）：
-- **水位跨越提醒**：当活跃 token 首次跨越 **380,000 (74%)** 或 **450,000 (88%)** 时，自动注入系统提示要求立即刷新 `MEMORY_ANCHOR.md`（若 90 秒内已更新则跳过；CRITICAL 级别免打扰窗口缩减为 30 秒，避免漏报）。若会话日志无 token 遥测字段，CLI 会自动根据末次压缩以来的累积字节数估算活跃水位。
-- **压缩后秒级恢复**：一旦检测到新触发的活跃 `CHECKPOINT`（自动忽略已被回退的旧检查点或陈旧历史），钩子会自动读取 `MEMORY_ANCHOR.md`，并在按需加载 `transcript_full.jsonl`（小文件全量读，大文件窗口读）后提取被截断的近期/压缩前用户输入与模型执行快照，通过 `systemMessage` 无损注入上下文。
+- **水位跨越提醒**：结合上一轮 `PLANNER_RESPONSE` token 数与本轮新增工具输出字节增量，当有效上下文首次跨越 **380,000 (74%)** 或 **450,000 (88%)** 时，向交互式主会话注入非打断式提醒（90 秒免打扰，CRITICAL 为 30 秒）；对无 `USER_INPUT` 的后台自治 Swarm Worker 自动静默跳过命令提醒，绝不干扰 `post_message` + `swarm_wait` 协作协议；只读子代理（`research` / `browser`）或 Plan Mode 下无需执行写入。
+- **压缩后秒级恢复**：一旦检测到新触发的活跃 `CHECKPOINT`（自动忽略已回退或陈旧检查点，并清空压缩前旧 token 计数），自动读取 `MEMORY_ANCHOR.md` 与 `transcript_full.jsonl` 中被截断（>1KB）的历史长输入、近期有效输入（自动跳过裸 `/compact`；Swarm Worker 则恢复任务简报 `SYSTEM_MESSAGE`）与模型快照，通过标准 `injectSteps.systemMessage` 无损注入上下文。
 
 ---
 

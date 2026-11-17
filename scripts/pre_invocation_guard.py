@@ -4,11 +4,11 @@
 Reads the PreInvocation JSON payload from stdin, performs a fast tail scan of
 `transcript.jsonl` (<256 KB), and acts on two edge-triggered conditions:
   1. New CHECKPOINT compaction detected -> recovers MEMORY_ANCHOR.md, untruncated
-     recent/pre-compaction USER_INPUT prompts from transcript_full.jsonl, and the
+     recent/truncated USER_INPUT prompts from transcript_full.jsonl, and the
      pre-compaction PLANNER_RESPONSE snapshot, injecting them as a systemMessage.
-  2. Context token watermark crossed (380k / 450k) -> injects an urgent reminder
-     to persist constraints, exact paths/metrics, dead ends, and state into
-     MEMORY_ANCHOR.md before compaction triggers.
+  2. Context token watermark crossed (380k / 450k) on interactive user sessions ->
+     injects a non-disruptive, capability-aware reminder to persist constraints,
+     exact paths/metrics, dead ends, and state into MEMORY_ANCHOR.md.
 
 Fail-safe by design: any unexpected exception outputs `{}` and exits 0 so it
 never blocks or breaks the agent execution loop.
@@ -17,7 +17,6 @@ never blocks or breaks the agent execution loop.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -28,14 +27,18 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from context_guardian import (  # noqa: E402
+    BYTES_PER_TOKEN_ESTIMATE,
     CHECKPOINT_USER_TRUNCATE_BYTES,
     COMPACTION_THRESHOLD_TOKENS,
     CRITICAL_THRESHOLD_TOKENS,
     WARNING_THRESHOLD_TOKENS,
+    atomic_write_text,
     configure_utf8_stdio,
+    estimate_record_bytes,
     extract_user_request,
     format_step_tokens,
     format_tool_calls,
+    is_slash_compact_prompt,
 )
 
 TAIL_BYTES = 262_144  # 256 KB for fast PreInvocation tail scan
@@ -133,16 +136,9 @@ def load_state(state_path: Path) -> Dict[str, Any]:
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
-    """Persist edge-trigger state atomically via .tmp and os.replace (LOW-10)."""
+    """Persist edge-trigger state atomically via PID-unique .tmp and os.replace (LOW-10)."""
     try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = state_path.with_suffix(".json.tmp")
-        tmp_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            errors="replace",
-        )
-        os.replace(tmp_path, state_path)
+        atomic_write_text(state_path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
     except Exception:
         pass
 
@@ -170,68 +166,111 @@ def extract_compaction_recovery_bundle(
     full_path: Path,
     target_ckpt_key: str,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Extract untruncated USER_INPUTs and pre-compaction PLANNER_RESPONSE."""
+    """Extract untruncated active USER_INPUTs (or worker SYSTEM_MESSAGEs) and pre-compaction PLANNER_RESPONSE."""
     records = read_full_window(full_path, target_ckpt_key)
     if not records:
         return [], None
 
+    canonicalize_tail_records(records)
+
     ckpt_pos = -1
     for idx, rec in enumerate(records):
-        if rec.get("type") == "CHECKPOINT" and make_checkpoint_key(rec) == target_ckpt_key:
+        if (
+            not rec.get("_superseded")
+            and rec.get("type") == "CHECKPOINT"
+            and make_checkpoint_key(rec) == target_ckpt_key
+        ):
             ckpt_pos = idx
 
-    all_user_inputs: List[Tuple[int, Dict[str, Any]]] = [
-        (idx, rec) for idx, rec in enumerate(records) if rec.get("type") == "USER_INPUT"
-    ]
-
-    chosen_positions: List[int] = []
-    # Always include the latest 2 overall USER_INPUT steps
-    for idx, _ in all_user_inputs[-2:]:
-        chosen_positions.append(idx)
-
-    # Also ensure the USER_INPUT immediately preceding the latest CHECKPOINT is included
-    if ckpt_pos >= 0:
-        pre_ckpt_inputs = [idx for idx, _ in all_user_inputs if idx < ckpt_pos]
-        if pre_ckpt_inputs:
-            last_pre_idx = pre_ckpt_inputs[-1]
-            if last_pre_idx not in chosen_positions:
-                chosen_positions.append(last_pre_idx)
-            if len(pre_ckpt_inputs) >= 2 and len(chosen_positions) < 3:
-                prev_pre_idx = pre_ckpt_inputs[-2]
-                if prev_pre_idx not in chosen_positions:
-                    chosen_positions.append(prev_pre_idx)
-
-    chosen_positions = sorted(set(chosen_positions))
-    recovered_inputs: List[Dict[str, Any]] = []
-    seen_dedup = set()
-    for pos in chosen_positions:
-        rec = records[pos]
-        prompt = extract_user_request(rec.get("content"))
-        dedup_key = (rec.get("step_index"), prompt)
-        if dedup_key in seen_dedup:
+    active_user_inputs: List[Tuple[int, Dict[str, Any], str, int]] = []
+    for idx, rec in enumerate(records):
+        if rec.get("_superseded") or rec.get("type") != "USER_INPUT":
             continue
-        seen_dedup.add(dedup_key)
+        prompt = extract_user_request(rec.get("content"))
         utf8_bytes = len(prompt.encode("utf-8", errors="replace"))
+        active_user_inputs.append((idx, rec, prompt, utf8_bytes))
 
-        is_before_ckpt = (ckpt_pos >= 0) and (pos < ckpt_pos)
-        is_truncated = is_before_ckpt and (utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES)
-        recovered_inputs.append(
-            {
-                "step_index": rec.get("step_index"),
-                "created_at": rec.get("created_at", ""),
-                "bytes": utf8_bytes,
-                "truncated_in_checkpoint": is_truncated,
-                "at_risk": (not is_before_ckpt) and (utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES),
-                "prompt": clip(prompt, 4000),
-            }
-        )
+    recovered_inputs: List[Dict[str, Any]] = []
 
-    # LOW-9: Only look for pre_planner if ckpt_pos was found in window
+    if active_user_inputs:
+        substantive = [item for item in active_user_inputs if not is_slash_compact_prompt(item[2])]
+        pool = substantive if substantive else active_user_inputs
+
+        chosen_positions: List[int] = []
+        # 1) Latest 2 substantive USER_INPUTs overall
+        for idx, _, _, _ in pool[-2:]:
+            chosen_positions.append(idx)
+
+        if ckpt_pos >= 0:
+            # 2) Substantive USER_INPUT immediately preceding the CHECKPOINT
+            pre_pool = [idx for idx, _, _, _ in pool if idx < ckpt_pos]
+            for idx in pre_pool[-2:]:
+                chosen_positions.append(idx)
+
+            # 3) Up to 2 most recent >1KB truncated pre-checkpoint USER_INPUTs (even if older than short turns!)
+            pre_truncated = [
+                idx
+                for idx, _, _, b_len in active_user_inputs
+                if idx < ckpt_pos and b_len > CHECKPOINT_USER_TRUNCATE_BYTES
+            ]
+            for idx in pre_truncated[-2:]:
+                chosen_positions.append(idx)
+
+        seen_dedup = set()
+        for pos in sorted(set(chosen_positions)):
+            rec = records[pos]
+            prompt = extract_user_request(rec.get("content"))
+            dedup_key = (rec.get("step_index"), prompt)
+            if dedup_key in seen_dedup:
+                continue
+            seen_dedup.add(dedup_key)
+            utf8_bytes = len(prompt.encode("utf-8", errors="replace"))
+            is_before_ckpt = (ckpt_pos >= 0) and (pos < ckpt_pos)
+            recovered_inputs.append(
+                {
+                    "kind": "USER_INPUT",
+                    "step_index": rec.get("step_index"),
+                    "created_at": rec.get("created_at", ""),
+                    "bytes": utf8_bytes,
+                    "truncated_in_checkpoint": is_before_ckpt and (utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES),
+                    "at_risk": (not is_before_ckpt) and (utf8_bytes > CHECKPOINT_USER_TRUNCATE_BYTES),
+                    "prompt": clip(prompt, 4000),
+                }
+            )
+    elif ckpt_pos > 0:
+        # Autonomous Swarm Worker / Subagent fallback (no USER_INPUT steps in transcript):
+        # recover initial assignment / recent pre-checkpoint SYSTEM_MESSAGE steps.
+        sys_msgs = [
+            (idx, r)
+            for idx, r in enumerate(records[:ckpt_pos])
+            if not r.get("_superseded") and r.get("type") == "SYSTEM_MESSAGE" and r.get("content")
+        ]
+        chosen_sys: List[Tuple[int, Dict[str, Any]]] = []
+        if sys_msgs:
+            chosen_sys.append(sys_msgs[0])
+            if len(sys_msgs) > 1:
+                chosen_sys.append(sys_msgs[-1])
+        for _pos, rec in chosen_sys:
+            content = str(rec.get("content") or "").strip()
+            utf8_bytes = len(content.encode("utf-8", errors="replace"))
+            recovered_inputs.append(
+                {
+                    "kind": "SYSTEM_MESSAGE",
+                    "step_index": rec.get("step_index"),
+                    "created_at": rec.get("created_at", ""),
+                    "bytes": utf8_bytes,
+                    "truncated_in_checkpoint": False,
+                    "at_risk": False,
+                    "prompt": clip(content, 2500),
+                }
+            )
+
+    # LOW-9: Only look for active pre_planner if ckpt_pos was found in window
     pre_planner: Optional[Dict[str, Any]] = None
     if ckpt_pos >= 0:
         for pos in range(ckpt_pos - 1, -1, -1):
             rec = records[pos]
-            if rec.get("type") == "PLANNER_RESPONSE":
+            if not rec.get("_superseded") and rec.get("type") == "PLANNER_RESPONSE":
                 pre_planner = rec
                 break
 
@@ -246,7 +285,7 @@ def build_post_compaction_output(
     ckpt_key: str,
     is_lossy_source: bool = False,
 ) -> Dict[str, Any]:
-    """Construct injectSteps JSON after a newly detected CHECKPOINT compaction."""
+    """Construct official PreInvocation injectSteps JSON after a newly detected CHECKPOINT compaction."""
     recovered_inputs, pre_planner = extract_compaction_recovery_bundle(full_path, ckpt_key)
     anchor_path = artifact_dir / "MEMORY_ANCHOR.md"
     guardian_posix = (SCRIPT_DIR / "context_guardian.py").as_posix()
@@ -272,12 +311,12 @@ def build_post_compaction_output(
         sections.extend(
             [
                 "### 1. 记忆锚点状态",
-                f"[WARNING] 尚未创建 `{anchor_path}`。请立即用 `init-anchor` 并补充关键约束、路径、死胡同与当前状态，防止后续再次压缩丢失。",
+                f"[NOTE] 尚未创建 `{anchor_path}`。若当前会话具备写入与命令权限（非只读子代理/非只读规划阶段），可在当前步骤收尾时运行 `init-anchor` 固化关键约束与死胡同。",
                 "",
             ]
         )
 
-    sections.append(f"### 2. 从 `{source_desc}` 恢复的近期/压缩前完整用户输入")
+    sections.append(f"### 2. 从 `{source_desc}` 恢复的近期/压缩前完整输入")
     if recovered_inputs:
         for item in recovered_inputs:
             trunc_note = ""
@@ -286,13 +325,14 @@ def build_post_compaction_output(
             elif item.get("at_risk"):
                 trunc_note = " [>1KB 易截断]"
 
+            kind = item.get("kind", "USER_INPUT")
             sections.append(
-                f"- **USER_INPUT step={item['step_index']}** ({item['created_at']}, {item['bytes']} bytes){trunc_note}:"
+                f"- **{kind} step={item['step_index']}** ({item['created_at']}, {item['bytes']} bytes){trunc_note}:"
             )
             sections.append(item["prompt"])
             sections.append("")
     else:
-        sections.append("(未检索到近期 USER_INPUT 记录)")
+        sections.append("(未检索到近期输入记录)")
         sections.append("")
 
     if pre_planner:
@@ -312,23 +352,18 @@ def build_post_compaction_output(
 
     sections.extend(
         [
-            "### 4. 按需无损回查命令（禁止用 read_file 裸读整个 transcript_full.jsonl）",
+            "### 4. 按需无损回查命令（如具备命令行工具权限；禁止用 read_file 裸读整个 transcript_full.jsonl）",
             f'- 完整恢复报告: `python "{guardian_posix}" recover -c "{conversation_id}"`',
             f'- 关键词检索: `python "{guardian_posix}" search "<关键词>" -c "{conversation_id}"`',
             f'- 精确读取某步: `python "{guardian_posix}" step <step_index> -c "{conversation_id}"`',
         ]
     )
 
-    user_md = (
-        f"> 🛡️ **防失忆护盾 (Anti-Compaction Guard)**：检测到会话刚触发有损压缩（Step #{ckpt_step}），"
-        f"已自动从 `{source_desc}` 与 `MEMORY_ANCHOR.md` 无损恢复完整用户输入与核心记忆锚点。"
-    )
     return {
         "injectSteps": [
             {
                 "systemMessage": {
                     "systemMessage": "\n".join(sections),
-                    "metadata": {"user_markdown": user_md},
                 }
             }
         ]
@@ -341,7 +376,7 @@ def build_watermark_output(
     latest_tokens: int,
     band: int,
 ) -> Dict[str, Any]:
-    """Construct injectSteps JSON when context crosses 380k / 450k warning bands."""
+    """Construct official PreInvocation injectSteps JSON when context crosses 380k / 450k warning bands."""
     anchor_path = artifact_dir / "MEMORY_ANCHOR.md"
     guardian_posix = (SCRIPT_DIR / "context_guardian.py").as_posix()
     pct = (latest_tokens / COMPACTION_THRESHOLD_TOKENS) * 100.0
@@ -349,27 +384,23 @@ def build_watermark_output(
 
     sys_msg = "\n".join(
         [
-            f"[CONTEXT WATERMARK {level}] 当前上下文已达 {latest_tokens:,} / {COMPACTION_THRESHOLD_TOKENS:,} tokens ({pct:.1f}%)。",
+            f"[CONTEXT WATERMARK {level}] 当前上下文已达 ~{latest_tokens:,} / {COMPACTION_THRESHOLD_TOKENS:,} tokens ({pct:.1f}%)。",
             "Antigravity 即将或很快会在 ~512k tokens 触发有损 CHECKPOINT 压缩（仅保留泛化摘要，且历史用户输入将被截断至 ~1000 字节）。",
-            f"请立即创建或更新 `{anchor_path}`，确保以下 5 项完整固化（如尚未初始化可先运行 `init-anchor`）：",
+            f"请在不打断当前正在执行的工具链或子代理协调的前提下，于本轮步骤收尾时创建或更新 `{anchor_path}`，确保以下 5 项完整固化：",
             "1. 铁律与负面约束（用户禁止事项、不可改动的文件/参数）",
             "2. 精确事实与参数账本（绝对路径、偏移量、命令、精确指标）",
             "3. 已排除死胡同（失败方案及原因，防压缩后重复踩坑）",
             "4. 里程碑与下一步唯一精确动作",
             "5. 关键历史步骤 step_index 书签",
-            f'初始化/检查命令：`python "{guardian_posix}" init-anchor -c "{conversation_id}"`',
+            f'初始化命令：`python "{guardian_posix}" init-anchor -c "{conversation_id}"`',
+            "（注：若当前处于只读模式如 Plan Mode、`research`/`browser` 子代理或无写入权限，请忽略文件写入指令并直接继续当前主线任务。）",
         ]
-    )
-    user_md = (
-        f"> ⚠️ **上下文高水位预警**：当前上下文已达 **{latest_tokens:,} tokens**"
-        f"（逼近 ~512k 有损压缩阈值），已提醒 Agent 将关键约束与进度无损固化至 `MEMORY_ANCHOR.md`。"
     )
     return {
         "injectSteps": [
             {
                 "systemMessage": {
                     "systemMessage": sys_msg,
-                    "metadata": {"user_markdown": user_md},
                 }
             }
         ]
@@ -381,7 +412,7 @@ def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[P
 
     Returns:
         (response_dict, optional_state_to_persist)
-        HIGH-2: State is only persisted after output construction succeeds.
+        HIGH-2: State is only persisted after output construction & stdout flush succeed.
     """
     transcript_str = payload.get("transcriptPath")
     artifact_str = payload.get("artifactDirectoryPath")
@@ -401,21 +432,39 @@ def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[P
     canonicalize_tail_records(tail_records)
 
     latest_tokens = 0
+    post_planner_bytes = 0
     latest_checkpoint: Optional[Dict[str, Any]] = None
     last_ckpt_idx: Optional[int] = None
+    has_explicit_user_input = bool(str(payload.get("lastUserInput") or "").strip())
 
     for idx, rec in enumerate(tail_records):
         if rec.get("_superseded"):
             continue
-        if rec.get("type") == "PLANNER_RESPONSE":
+        rtype = rec.get("type")
+        if rtype == "USER_INPUT":
+            has_explicit_user_input = True
+        if rtype == "PLANNER_RESPONSE":
             tok = format_step_tokens(rec)
             if tok > 0:
                 latest_tokens = tok
-        elif rec.get("type") == "CHECKPOINT":
+                post_planner_bytes = 0
+            elif latest_tokens > 0:
+                post_planner_bytes += estimate_record_bytes(rec)
+        elif rtype == "CHECKPOINT":
             latest_checkpoint = rec
             last_ckpt_idx = idx
+            # Reset pre-compaction token count across compaction boundary!
+            latest_tokens = 0
+            post_planner_bytes = 0
+        elif latest_tokens > 0:
+            post_planner_bytes += estimate_record_bytes(rec)
 
-    current_band = watermark_band(latest_tokens)
+    effective_tokens = (
+        latest_tokens + int(post_planner_bytes / BYTES_PER_TOKEN_ESTIMATE)
+        if latest_tokens > 0
+        else 0
+    )
+    current_band = watermark_band(effective_tokens)
     state_path = artifact_dir / "scratch" / ".compaction_guard_state.json"
     state = load_state(state_path)
 
@@ -429,21 +478,18 @@ def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[P
         if ckpt_step > prev_step or ckpt_key != prev_key:
             # HIGH-1: Check if this is truly a newly triggered checkpoint or a stale checkpoint
             # from long ago (e.g. hook enabled mid-session or state reset).
-            # Count PLANNER_RESPONSE occurrences after this checkpoint in tail_records.
             post_ckpt_planners = [
                 r for r in tail_records[last_ckpt_idx + 1 :]
                 if r.get("type") == "PLANNER_RESPONSE" and not r.get("_superseded")
             ]
 
             if len(post_ckpt_planners) > 1:
-                # Historical checkpoint from many turns ago; silently update state without injecting
                 state["last_handled_checkpoint_step"] = ckpt_step
                 state["last_handled_checkpoint_key"] = ckpt_key
                 state["last_warned_band"] = current_band
                 save_state(state_path, state)
                 return {}, None
 
-            # Fresh compaction!
             full_path = transcript_path.parent / "transcript_full.jsonl"
             is_lossy = False
             if not full_path.is_file():
@@ -459,7 +505,6 @@ def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[P
                 is_lossy_source=is_lossy,
             )
 
-            # Prepare state update to persist after output is ready (HIGH-2)
             state["last_handled_checkpoint_step"] = ckpt_step
             state["last_handled_checkpoint_key"] = ckpt_key
             state["last_warned_band"] = current_band
@@ -467,27 +512,33 @@ def run_guard(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Tuple[P
 
     last_warned_band = int(state.get("last_warned_band", 0))
 
-    # LOW-8: Only consider band resets if we actually saw valid token telemetry
-    if latest_tokens > 0 and current_band < last_warned_band:
+    # LOW-8: Only consider band resets if we actually saw valid post-compaction token telemetry
+    if effective_tokens > 0 and current_band < last_warned_band:
         state["last_warned_band"] = current_band
         save_state(state_path, state)
         return {}, None
 
     # Edge-triggered Case B: context crossed into a higher watermark band (>= 380k or >= 450k)
-    if current_band > last_warned_band and latest_tokens >= WARNING_THRESHOLD_TOKENS:
+    if current_band > last_warned_band and effective_tokens >= WARNING_THRESHOLD_TOKENS:
+        # Autonomous Swarm Workers / Monitors have no USER_INPUT records: never interrupt
+        # their tight post_message + swarm_wait protocol with init-anchor detours!
+        if not has_explicit_user_input:
+            state["last_warned_band"] = current_band
+            save_state(state_path, state)
+            return {}, None
+
         # LOW-7: Check anchor grace window BEFORE advancing last_warned_band
         anchor_path = artifact_dir / "MEMORY_ANCHOR.md"
         if anchor_path.is_file():
             age_sec = time.time() - anchor_path.stat().st_mtime
             grace_sec = ANCHOR_CRITICAL_GRACE_SEC if current_band >= 2 else ANCHOR_RECENT_GRACE_SEC
             if 0 <= age_sec <= grace_sec:
-                # In grace period: don't alert and don't advance band so we can alert once grace expires
                 return {}, None
 
         output = build_watermark_output(
             conversation_id=conversation_id,
             artifact_dir=artifact_dir,
-            latest_tokens=latest_tokens,
+            latest_tokens=effective_tokens,
             band=current_band,
         )
 

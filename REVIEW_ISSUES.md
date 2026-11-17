@@ -493,3 +493,26 @@
    - `resolve_brain_dir` 加入会话 ID 格式校验与路径穿越防御；检测到 120 秒内存在多会话活跃时向 `stderr` 打印并发预警，写操作（`init-anchor`）强制要求指定 `-c`，避免 Swarm 串台。
    - 钩子生成命令使用当前解释器绝对路径 `sys.executable` 并显式携带 `-X utf8` 标志；同时支持环境变量 `$AGY_BRAIN_ROOT`、命令行 `--brain-root` 以及多形态目录（CLI/IDE）自动探测。
 
+---
+
+## 6. 二轮实测复查与热重载加固总结 (Second-Pass Live Audit & Hot-Reload Hardening)
+
+在 512k 上下文环境与多对话/Swarm 并发运行场景下的二轮深度实测中，进一步定位并彻底修复了以下实战隐患，全部验证纳入 [`tests/test_fixes.py`](./tests/test_fixes.py)：
+
+1. **CRITICAL — 修复 Windows `cmd /c` 下内嵌双引号被 Go `EscapeArg` 转义为 `\"` 导致钩子失效的问题**：
+   - **实测根因**：Antigravity 宿主（Go `exec.Command("cmd", "/c", command)`）在 Windows 下构造进程参数时，会将 `command` 中内嵌的 `"` 转义为 `\"`；而 `cmd.exe` 不识别 `\"` 引号定界符，直接报错 `'\"C:/.../python.exe\"' is not recognized`（退出码 `1`）。
+   - **修复方案**：新增 `make_windows_cmd_safe_path()`——Windows 下利用宿主在 `hooks.json` 所在目录执行的特性优先生成无空格相对脚本路径（`skills/anti-compaction-amnesia/scripts/pre_invocation_guard.py`），对含空格或元字符的路径自动通过 `GetShortPathNameW` 转为 8.3 短路径，保证命令**零内嵌双引号**；并在 `tests/test_fixes.py` 中直接通过 `subprocess.run(["cmd", "/c", cmd])` 实测校验退出码 `0`。
+2. **HIGH — 严格对齐官方 `PreInvocation` `injectSteps` 纯 camelCase 契约**：
+   - 去除 `CortexStepSystemMessage` 中非必需的 `"metadata": {"user_markdown": ...}` 字段，严格输出 `docs/hooks.md` 示例中的标准结构 `{"injectSteps": [{"systemMessage": {"systemMessage": "..."}}]}`，彻底杜绝 `protojson` 未知字段反序列化丢包风险，并在 UI 中以折叠式 System Message 简洁呈现。
+3. **HIGH — 多代理并发（Swarm Worker）与只读子代理无感保护**：
+   - 实测发现后台自治 Swarm Worker 全程仅含 `SYSTEM_MESSAGE` 而无 `USER_INPUT`。`Case B` 水位预警现自动识别无 `USER_INPUT` 的后台 Worker 并静默放行 `{}`，绝不打断 `post_message` + `swarm_wait` 协作循环；同时对交互式会话采用非打断式、权限感知提示（明确兼容 Plan Mode 与只读 `research`/`browser` 子代理）。若 Swarm Worker 触发 `512k CHECKPOINT`，`Case A` 会自动回退提取压缩前任务简报 `SYSTEM_MESSAGE` 与执行快照。
+4. **HIGH — 修复 `/compact` 及短回复掩盖早期 `>1KB` 被截断长输入的问题**：
+   - `extract_compaction_recovery_bundle` 与 `cmd_recover` 第 3 节现自动调用 `canonicalize_tail_records` 剔除已回退步骤、过滤裸 `/compact` 指令，并强制纳入压缩前最近的 **`>1KB` 被截断长用户输入**，防止几次短对话后触发压缩时漏掉真正被截断的核心需求文档。
+5. **HIGH — 修复压缩边界旧 Token 残留与大体积工具输出一步滞后（`LOW-11`）**：
+   - `pre_invocation_guard.py` 在扫描到活跃 `CHECKPOINT` 时立即归零 `latest_tokens` 与字节增量，防止压缩前 460k+ 水位跨过压缩点引发误报；同时累加末次 `PLANNER_RESPONSE` 之后新增工具输出与消息的 UTF-8 字节估算值，在大输出工具返回当轮即可提前预警。
+6. **MEDIUM — 补齐 `search` / `recover` / 二进制读取 / 原子写与 `argparse` 细节**：
+   - `cmd_search` 补调 `canonicalize_records()` 使 `[SUPERSEDED]` 标记生效，并新增 `flatten_searchable_text()` 深度展开未转义文本（原生匹配含引号命令与多行参数）；
+   - `iter_jsonl_records` 改为二进制 `b"\n"` 行迭代，免疫字符串内孤立 `\r` (`0x0D`) 断行；
+   - 新增 PID 隔离 + Windows `PermissionError` 短退避重试的 `atomic_write_text()`；
+   - 子命令 `--brain-root` 改用 `default=argparse.SUPPRESS`，修复根级 `--brain-root` 被子解析器覆盖为 `None` 的问题。
+
